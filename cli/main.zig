@@ -86,55 +86,92 @@ fn handleClaudeHook(args: [][*:0]u8) void {
 
     const subcommand = std.mem.span(args[2]);
     const ws_id = std.posix.getenv("CMUX_WORKSPACE_ID") orelse "";
-    const surface_id = std.posix.getenv("CMUX_SURFACE_ID") orelse "";
+    _ = std.posix.getenv("CMUX_SURFACE_ID") orelse "";
 
     // Read stdin (hook JSON payload) — extract message if present
     var stdin_buf: [4096]u8 = undefined;
     const stdin_len = std.io.getStdIn().read(&stdin_buf) catch 0;
     const stdin_data = stdin_buf[0..stdin_len];
 
-    // Try to extract a message from the hook JSON (look for "message" field)
+    // Log to file (hook stderr is suppressed by 2>/dev/null)
+    if (std.fs.createFileAbsolute("/tmp/cmux-hooks.log", .{ .truncate = false })) |file| {
+        defer file.close();
+        file.seekFromEnd(0) catch {};
+        const w = file.writer();
+        w.print("[cmux hook] {s} ws={s} stdin_len={}\n", .{
+            subcommand, ws_id, stdin_len,
+        }) catch {};
+        if (stdin_len > 0) {
+            const preview_len = @min(stdin_len, 500);
+            w.print("[cmux hook] payload: {s}\n", .{stdin_data[0..preview_len]}) catch {};
+        }
+    } else |_| {}
+
+    // Extract fields from hook JSON
+    const last_msg = extractJsonField(stdin_data, "last_assistant_message");
     const hook_message = extractJsonField(stdin_data, "message");
-    _ = surface_id;
+    const notif_type = extractJsonField(stdin_data, "notification_type");
+    const tool_name = extractJsonField(stdin_data, "tool_name");
 
     if (std.mem.eql(u8, subcommand, "session-start") or std.mem.eql(u8, subcommand, "active")) {
-        // Claude started — set running (may not fire from native hooks)
+        // PreToolUse — Claude is actively working. Set ✦ Running.
         var cmd_buf: [512]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "set_status claude_code Running --tab={s}", .{ws_id}) catch return;
         _ = sendCommand(cmd) catch {};
+
+        // Show what tool Claude is using as message preview
+        if (tool_name) |tn| {
+            var msg_buf: [512]u8 = undefined;
+            const msg_cmd = std.fmt.bufPrint(&msg_buf, "set_status claude_message Using {s}... --tab={s}", .{ tn, ws_id }) catch null;
+            if (msg_cmd) |mc| _ = sendCommand(mc) catch {};
+        }
     } else if (std.mem.eql(u8, subcommand, "stop") or std.mem.eql(u8, subcommand, "idle")) {
-        // Claude stopped — set message, clear status, notify
+        // Stop — Claude finished its turn. Show last message + unread dot.
+        // Payload has: last_assistant_message
 
-        // Set the last message if we got one from notification, otherwise "Completed"
-        var msg_cmd_buf: [512]u8 = undefined;
-        const msg = if (hook_message) |m|
-            std.fmt.bufPrint(&msg_cmd_buf, "set_status claude_message {s} --tab={s}", .{ m, ws_id }) catch null
-        else
-            std.fmt.bufPrint(&msg_cmd_buf, "set_status claude_message Completed --tab={s}", .{ws_id}) catch null;
-        if (msg) |m| _ = sendCommand(m) catch {};
+        // Set the message preview from last_assistant_message
+        if (last_msg) |m| {
+            var msg_buf: [512]u8 = undefined;
+            const msg_cmd = std.fmt.bufPrint(&msg_buf, "set_status claude_message {s} --tab={s}", .{ m[0..@min(m.len, 200)], ws_id }) catch null;
+            if (msg_cmd) |mc| _ = sendCommand(mc) catch {};
+        }
 
-        var cmd_buf: [512]u8 = undefined;
-        const clear = std.fmt.bufPrint(&cmd_buf, "clear_status claude_code --tab={s}", .{ws_id}) catch return;
-        _ = sendCommand(clear) catch {};
-
-        var notify_buf: [512]u8 = undefined;
-        const notify = std.fmt.bufPrint(&notify_buf, "notify Claude Code|Completed|Task finished", .{}) catch return;
-        _ = sendCommand(notify) catch {};
-    } else if (std.mem.eql(u8, subcommand, "notification") or std.mem.eql(u8, subcommand, "notify")) {
-        // Claude finished its turn — mark as unread (blue dot)
+        // Set unread (blue dot) — will only show on inactive tabs
         var cmd_buf: [512]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "set_status claude_code Unread --tab={s}", .{ws_id}) catch return;
         _ = sendCommand(cmd) catch {};
 
-        // Update the message preview
+        // Desktop notification with the actual message
+        const notif_text = last_msg orelse "Claude finished";
+        var notify_buf: [512]u8 = undefined;
+        const notify = std.fmt.bufPrint(&notify_buf, "notify Claude Code|{s}", .{notif_text[0..@min(notif_text.len, 200)]}) catch return;
+        _ = sendCommand(notify) catch {};
+    } else if (std.mem.eql(u8, subcommand, "notification") or std.mem.eql(u8, subcommand, "notify")) {
+        // Notification — Claude needs attention.
+        // notification_type: "idle_prompt" (waiting) or "permission_prompt" (needs permission)
+        const is_permission = if (notif_type) |nt| std.mem.eql(u8, nt, "permission_prompt") else false;
+
+        if (is_permission) {
+            // Permission needed — purple attention dot
+            var cmd_buf: [512]u8 = undefined;
+            const cmd = std.fmt.bufPrint(&cmd_buf, "set_status claude_code Needs input --tab={s}", .{ws_id}) catch return;
+            _ = sendCommand(cmd) catch {};
+        } else {
+            // Idle prompt — unread dot (Claude finished, waiting for input)
+            var cmd_buf: [512]u8 = undefined;
+            const cmd = std.fmt.bufPrint(&cmd_buf, "set_status claude_code Unread --tab={s}", .{ws_id}) catch return;
+            _ = sendCommand(cmd) catch {};
+        }
+
+        // Update message preview
         if (hook_message) |m| {
             var msg_buf: [512]u8 = undefined;
-            const msg_cmd = std.fmt.bufPrint(&msg_buf, "set_status claude_message {s} --tab={s}", .{ m, ws_id }) catch null;
+            const msg_cmd = std.fmt.bufPrint(&msg_buf, "set_status claude_message {s} --tab={s}", .{ m[0..@min(m.len, 200)], ws_id }) catch null;
             if (msg_cmd) |mc| _ = sendCommand(mc) catch {};
         }
 
         // Desktop notification
-        const notif_text = hook_message orelse "Claude finished";
+        const notif_text = hook_message orelse "Claude needs attention";
         var notify_buf: [512]u8 = undefined;
         const notify = std.fmt.bufPrint(&notify_buf, "notify Claude Code|{s}", .{notif_text[0..@min(notif_text.len, 200)]}) catch return;
         _ = sendCommand(notify) catch {};
