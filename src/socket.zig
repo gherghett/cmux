@@ -457,6 +457,12 @@ pub const SocketServer = struct {
         if (std.mem.eql(u8, key, "claude_code")) {
             if (std.mem.eql(u8, value, "Running")) {
                 ws.setClaudeStatus(.running);
+            } else if (std.mem.eql(u8, value, "Unread")) {
+                // Only show unread if not currently active
+                const is_active = (self.tab_manager.current() == ws);
+                if (!is_active) {
+                    ws.setClaudeStatus(.unread);
+                }
             } else {
                 // "Needs input", "Permission", etc. → attention
                 ws.setClaudeStatus(.attention);
