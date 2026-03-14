@@ -31,17 +31,22 @@ pub const Pane = struct {
     on_title: ?*const fn (title: [*:0]const u8, ctx: ?*anyopaque) void = null,
     on_title_ctx: ?*anyopaque = null,
 
+    browser_tabs: [16]?BrowserTab = [_]?BrowserTab{null} ** 16,
+    browser_tab_box: ?*c.GtkBox = null, // container for browser tab buttons in overlay
+
     pub const Tab = struct {
         id: uuid.Uuid,
         terminal: *c.VteTerminal,
         label: *c.GtkLabel,
         overlay: *c.GtkOverlay,
-        /// Tracked browser tab for this terminal (if any)
-        browser_target_id: [64]u8 = undefined,
-        browser_target_id_len: usize = 0,
-        browser_url: [256]u8 = undefined,
-        browser_url_len: usize = 0,
-        browser_button: ?*c.GtkWidget = null,
+    };
+
+    pub const BrowserTab = struct {
+        target_id: [64]u8,
+        target_id_len: usize,
+        url: [256]u8,
+        url_len: usize,
+        button: ?*c.GtkWidget,
     };
 
     pub fn init(
@@ -671,56 +676,146 @@ pub const Pane = struct {
     }
 
     fn storeBrowserTab(pane: *Pane, target_id: []const u8, url: []const u8) void {
-        const tab = pane.currentTab() orelse return;
+        // Find a free slot (or check for duplicate)
+        var slot: ?usize = null;
+        for (pane.browser_tabs, 0..) |bt_opt, i| {
+            if (bt_opt) |bt| {
+                // Skip if already tracking this URL
+                if (std.mem.eql(u8, bt.url[0..bt.url_len], url[0..@min(url.len, 256)])) return;
+            } else if (slot == null) {
+                slot = i;
+            }
+        }
+        const idx = slot orelse return; // all slots full
 
-        // Store the target ID
-        const tid_len = @min(target_id.len, 64);
-        @memcpy(tab.browser_target_id[0..tid_len], target_id[0..tid_len]);
-        tab.browser_target_id_len = tid_len;
+        const tid_len = @min(target_id.len, 63);
+        const url_len = @min(url.len, 255);
 
-        const url_len = @min(url.len, 256);
-        @memcpy(tab.browser_url[0..url_len], url[0..url_len]);
-        tab.browser_url_len = url_len;
+        var bt = BrowserTab{
+            .target_id = undefined,
+            .target_id_len = tid_len,
+            .url = undefined,
+            .url_len = url_len,
+            .button = null,
+        };
+        @memcpy(bt.target_id[0..tid_len], target_id[0..tid_len]);
+        bt.target_id[tid_len] = 0;
+        @memcpy(bt.url[0..url_len], url[0..url_len]);
+        bt.url[url_len] = 0;
 
-        // Create overlay button in bottom-right
-        if (tab.browser_button != null) {
-            // Remove old button
-            c.gtk_overlay_remove_overlay(tab.overlay, tab.browser_button.?);
+        pane.browser_tabs[idx] = bt;
+        pane.rebuildBrowserButtons();
+    }
+
+    /// Rebuild the overlay button box from the browser_tabs list.
+    fn rebuildBrowserButtons(self: *Pane) void {
+        const tab = self.currentTab() orelse return;
+
+        // Remove old button box
+        if (self.browser_tab_box) |old_box| {
+            c.gtk_overlay_remove_overlay(tab.overlay, asWidget(old_box));
+            self.browser_tab_box = null;
         }
 
-        // Shorten URL for display
-        var display_buf: [64]u8 = undefined;
-        const display = if (url_len > 50)
-            std.fmt.bufPrint(&display_buf, "🌐 {s}...", .{url[0..47]}) catch url[0..url_len]
-        else
-            std.fmt.bufPrint(&display_buf, "🌐 {s}", .{url[0..url_len]}) catch url[0..url_len];
+        // Count active tabs
+        var count: usize = 0;
+        for (self.browser_tabs) |bt_opt| {
+            if (bt_opt != null) count += 1;
+        }
+        if (count == 0) return;
 
-        var label_z: [65]u8 = undefined;
-        @memcpy(label_z[0..display.len], display);
-        label_z[display.len] = 0;
+        // Create vertical box for buttons, anchored bottom-right
+        const box: *c.GtkBox = @ptrCast(@alignCast(
+            c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2) orelse return,
+        ));
+        c.gtk_widget_set_halign(asWidget(box), c.GTK_ALIGN_END);
+        c.gtk_widget_set_valign(asWidget(box), c.GTK_ALIGN_END);
+        c.gtk_widget_set_margin_end(asWidget(box), 8);
+        c.gtk_widget_set_margin_bottom(asWidget(box), 8);
 
-        const btn = c.gtk_button_new_with_label(&label_z) orelse return;
-        c.gtk_widget_set_halign(btn, c.GTK_ALIGN_END);
-        c.gtk_widget_set_valign(btn, c.GTK_ALIGN_END);
-        c.gtk_widget_set_margin_end(btn, 8);
-        c.gtk_widget_set_margin_bottom(btn, 8);
-        c.gtk_widget_set_opacity(btn, 0.9);
-        c.gtk_widget_add_css_class(btn, "suggested-action");
+        for (&self.browser_tabs) |*bt_opt| {
+            if (bt_opt.*) |*bt| {
+                var display_buf: [80]u8 = undefined;
+                const ulen = bt.url_len;
+                const display = if (ulen > 40)
+                    std.fmt.bufPrint(&display_buf, "🌐 {s}...", .{bt.url[0..37]}) catch bt.url[0..ulen]
+                else
+                    std.fmt.bufPrint(&display_buf, "🌐 {s}", .{bt.url[0..ulen]}) catch bt.url[0..ulen];
 
-        // Store target_id on the button for the click handler
-        c.g_object_set_data(@ptrCast(@alignCast(btn)), "cmux-target-id", @constCast(@ptrCast(tab.browser_target_id[0..tid_len :0].ptr)));
+                var label_z: [81]u8 = undefined;
+                @memcpy(label_z[0..display.len], display);
+                label_z[display.len] = 0;
 
-        _ = c.g_signal_connect_data(
-            @ptrCast(btn),
-            "clicked",
-            @ptrCast(&onBrowserTabClick),
-            null,
-            null,
-            0,
-        );
+                const btn = c.gtk_button_new_with_label(&label_z) orelse continue;
+                c.gtk_widget_set_opacity(btn, 0.9);
+                c.gtk_widget_add_css_class(btn, "suggested-action");
 
-        c.gtk_overlay_add_overlay(tab.overlay, btn);
-        tab.browser_button = btn;
+                // Store target_id on the button
+                c.g_object_set_data(
+                    @ptrCast(@alignCast(btn)),
+                    "cmux-target-id",
+                    @constCast(@ptrCast(&bt.target_id)),
+                );
+
+                _ = c.g_signal_connect_data(
+                    @ptrCast(btn),
+                    "clicked",
+                    @ptrCast(&onBrowserTabClick),
+                    null,
+                    null,
+                    0,
+                );
+
+                bt.button = btn;
+                c.gtk_box_append(box, btn);
+            }
+        }
+
+        c.gtk_overlay_add_overlay(tab.overlay, asWidget(box));
+        self.browser_tab_box = box;
+    }
+
+    /// Called from the periodic sidebar refresh to check if CDP tabs are still open.
+    pub fn pollBrowserTabs(self: *Pane) void {
+        var has_tabs = false;
+        for (self.browser_tabs) |bt_opt| {
+            if (bt_opt != null) { has_tabs = true; break; }
+        }
+        if (!has_tabs) return;
+
+        // Fetch current CDP tabs
+        const pid = std.posix.fork() catch return;
+        if (pid == 0) {
+            const argv = [_:null]?[*:0]const u8{
+                "curl", "-s", "-o", "/tmp/cmux-cdp-poll.json",
+                "http://localhost:9222/json", null,
+            };
+            _ = std.posix.execvpeZ("curl", &argv, @ptrCast(std.c.environ)) catch {};
+            std.posix.exit(1);
+        }
+        _ = std.posix.waitpid(pid, 0);
+
+        const file = std.fs.openFileAbsolute("/tmp/cmux-cdp-poll.json", .{}) catch return;
+        defer file.close();
+        var buf: [32768]u8 = undefined;
+        const n = file.read(&buf) catch return;
+        const json = buf[0..n];
+
+        // Check each tracked tab — remove if not found in CDP response
+        var changed = false;
+        for (&self.browser_tabs) |*bt_opt| {
+            if (bt_opt.*) |bt| {
+                const tid = bt.target_id[0..bt.target_id_len];
+                if (std.mem.indexOf(u8, json, tid) == null) {
+                    // Tab no longer exists in browser
+                    log.info("CDP: tab {s} closed in browser, removing", .{tid});
+                    bt_opt.* = null;
+                    changed = true;
+                }
+            }
+        }
+
+        if (changed) self.rebuildBrowserButtons();
     }
 
     fn onBrowserTabClick(button: *c.GtkButton, _: ?*anyopaque) callconv(.C) void {
@@ -730,7 +825,6 @@ pub const Pane = struct {
 
         log.info("CDP: activating tab {s}", .{tid});
 
-        // Activate the tab via CDP + raise the browser window via xdotool
         var script_buf: [512]u8 = undefined;
         const script = std.fmt.bufPrint(&script_buf,
             "curl -s http://localhost:9222/json/activate/{s} >/dev/null; xdotool search --name 'Brave' windowactivate 2>/dev/null",

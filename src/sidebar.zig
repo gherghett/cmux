@@ -66,6 +66,17 @@ pub const Sidebar = struct {
     fn onPeriodicRefresh(user_data: ?*anyopaque) callconv(.C) c.gboolean {
         const self: *Sidebar = @ptrCast(@alignCast(user_data orelse return 0));
         self.refresh();
+
+        // Also poll CDP for closed browser tabs
+        var pane_list = std.ArrayList(*Pane).init(self.tab_manager.allocator);
+        defer pane_list.deinit();
+        for (self.tab_manager.workspaces.items) |ws| {
+            ws.allPanes(&pane_list) catch continue;
+        }
+        for (pane_list.items) |pane| {
+            pane.pollBrowserTabs();
+        }
+
         return 1; // keep running
     }
 
