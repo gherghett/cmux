@@ -68,17 +68,13 @@ pub const Sidebar = struct {
     fn onPeriodicRefresh(user_data: ?*anyopaque) callconv(.C) c.gboolean {
         const self: *Sidebar = @ptrCast(@alignCast(user_data orelse return 0));
 
-        // Update minimap snapshot for active workspace (doesn't rebuild rows)
+        // Update minimap snapshot for active workspace BEFORE rebuilding rows
         if (self.tab_manager.current()) |ws| {
             updateMinimapSnapshot(ws);
         }
 
-        // Only do full rebuild if workspace count or selection changed
-        const ws_count = self.tab_manager.workspaces.items.len;
-        const selected = self.tab_manager.selected;
-        if (ws_count != self.last_ws_count or selected != self.last_selected) {
-            self.refresh();
-        }
+        // Always refresh rows (titles, CWDs, status change frequently)
+        self.refresh();
 
         // Poll CDP for closed browser tabs
         var pane_list = std.ArrayList(*Pane).init(self.tab_manager.allocator);
