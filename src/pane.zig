@@ -431,8 +431,16 @@ pub const Pane = struct {
         @memcpy(url_z[0..ulen], url[0..ulen]);
         url_z[ulen] = 0;
 
+        // Get the display's launch context so the WM gives focus to the browser
+        const display = c.gdk_display_get_default();
+        const launch_ctx: ?*c.GAppLaunchContext = if (display) |d|
+            @ptrCast(@alignCast(c.gdk_display_get_app_launch_context(d)))
+        else
+            null;
+
         var err: ?*c.GError = null;
-        _ = c.g_app_info_launch_default_for_uri(&url_z, null, &err);
+        _ = c.g_app_info_launch_default_for_uri(&url_z, launch_ctx, &err);
+        if (launch_ctx) |ctx| c.g_object_unref(@ptrCast(@alignCast(ctx)));
         if (err) |e| {
             log.err("failed to open URL: {s}", .{@as([*:0]const u8, @ptrCast(e.message))});
             c.g_error_free(e);
