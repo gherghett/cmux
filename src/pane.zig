@@ -459,7 +459,13 @@ pub const Pane = struct {
         @memcpy(url_z[0..ulen], url[0..ulen]);
         url_z[ulen] = 0;
 
-        // Open URL via GLib launcher with display context for focus
+        // Snapshot current tab IDs BEFORE opening (to diff later)
+        var before_ids: [64][64]u8 = undefined;
+        var before_urls: [64][256]u8 = undefined;
+        var before_count: usize = 0;
+        snapshotCdpTabs(&before_ids, &before_urls, &before_count);
+
+        // Open URL via GLib launcher
         const display = c.gdk_display_get_default();
         const launch_ctx: ?*c.GAppLaunchContext = if (display) |d|
             @ptrCast(@alignCast(c.gdk_display_get_app_launch_context(d)))
@@ -468,14 +474,14 @@ pub const Pane = struct {
 
         var err: ?*c.GError = null;
         _ = c.g_app_info_launch_default_for_uri(&url_z, launch_ctx, &err);
-        if (launch_ctx) |ctx| c.g_object_unref(@ptrCast(@alignCast(ctx)));
+        if (launch_ctx) |lctx| c.g_object_unref(@ptrCast(@alignCast(lctx)));
         if (err) |e| {
             log.err("failed to open URL: {s}", .{@as([*:0]const u8, @ptrCast(e.message))});
             c.g_error_free(e);
             return;
         }
 
-        // Poll CDP to find the new browser tab
+        // Poll CDP to find the NEW tab (by diffing with snapshot)
         const ctx = std.heap.c_allocator.create(CdpPollCtx) catch return;
         ctx.url_len = ulen;
         @memcpy(ctx.url[0..ulen], url[0..ulen]);
@@ -483,8 +489,48 @@ pub const Pane = struct {
         ctx.attempts = 0;
         ctx.terminal = terminal;
         ctx.pane = pane;
+        ctx.before_ids = before_ids;
+        ctx.before_count = before_count;
 
         _ = c.g_timeout_add(500, @ptrCast(&onCdpPoll), ctx);
+    }
+
+    fn snapshotCdpTabIds(ids: *[64][64]u8, count: *usize) void {
+        count.* = 0;
+        const pid = std.posix.fork() catch return;
+        if (pid == 0) {
+            const argv = [_:null]?[*:0]const u8{
+                "curl", "-s", "-o", "/tmp/cmux-cdp-before.json",
+                "http://localhost:9222/json", null,
+            };
+            _ = std.posix.execvpeZ("curl", &argv, @ptrCast(std.c.environ)) catch {};
+            std.posix.exit(1);
+        }
+        _ = std.posix.waitpid(pid, 0);
+
+        const file = std.fs.openFileAbsolute("/tmp/cmux-cdp-before.json", .{}) catch return;
+        defer file.close();
+        var buf: [16384]u8 = undefined;
+        const n = file.read(&buf) catch return;
+        const json = buf[0..n];
+
+        // Extract all "id": "XXX" values
+        var pos: usize = 0;
+        while (pos < json.len and count.* < 64) {
+            const needle = "\"id\": \"";
+            if (std.mem.indexOfPos(u8, json, pos, needle)) |key_pos| {
+                const id_start = key_pos + needle.len;
+                if (std.mem.indexOfScalarPos(u8, json, id_start, '"')) |id_end| {
+                    const id = json[id_start..id_end];
+                    const ilen = @min(id.len, 64);
+                    @memcpy(ids[count.*][0..ilen], id[0..ilen]);
+                    // Pad rest with 0 for comparison
+                    if (ilen < 64) ids[count.*][ilen] = 0;
+                    count.* += 1;
+                    pos = id_end + 1;
+                } else break;
+            } else break;
+        }
     }
 
     const CdpPollCtx = struct {
@@ -493,85 +539,41 @@ pub const Pane = struct {
         attempts: u8,
         terminal: *c.VteTerminal,
         pane: ?*Pane,
+        before_ids: [64][64]u8,
+        before_count: usize,
     };
 
     fn onCdpPoll(user_data: ?*anyopaque) callconv(.C) c.gboolean {
         const ctx: *CdpPollCtx = @ptrCast(@alignCast(user_data orelse return 0));
         ctx.attempts += 1;
 
-        // Shell out to curl to query CDP
-        const pid = std.posix.fork() catch {
-            std.heap.c_allocator.destroy(ctx);
-            return 0;
-        };
-        if (pid == 0) {
-            const argv = [_:null]?[*:0]const u8{
-                "curl", "-s", "-o", "/tmp/cmux-cdp.json",
-                "http://localhost:9222/json",
-                null,
-            };
-            _ = std.posix.execvpeZ("curl", &argv, @ptrCast(std.c.environ)) catch {};
-            std.posix.exit(1);
-        }
-        _ = std.posix.waitpid(pid, 0);
+        // Fetch current tabs
+        var after_ids: [64][64]u8 = undefined;
+        var after_urls: [64][256]u8 = undefined;
+        var after_count: usize = 0;
+        snapshotCdpTabs(&after_ids, &after_urls, &after_count);
 
-        // Read and search for the URL
-        const file = std.fs.openFileAbsolute("/tmp/cmux-cdp.json", .{}) catch {
-            if (ctx.attempts >= 10) { std.heap.c_allocator.destroy(ctx); return 0; }
-            return 1;
-        };
-        defer file.close();
-        var buf: [16384]u8 = undefined;
-        const n = file.read(&buf) catch {
-            if (ctx.attempts >= 10) { std.heap.c_allocator.destroy(ctx); return 0; }
-            return 1;
-        };
-        const json = buf[0..n];
+        // Find the NEW tab (in after but not in before)
+        for (0..after_count) |i| {
+            const id = after_ids[i];
+            var is_new = true;
+            for (0..ctx.before_count) |j| {
+                if (std.mem.eql(u8, &id, &ctx.before_ids[j])) {
+                    is_new = false;
+                    break;
+                }
+            }
+            if (is_new) {
+                // Found the new tab!
+                const id_slice = std.mem.sliceTo(&after_ids[i], 0);
+                const url_slice = std.mem.sliceTo(&after_urls[i], 0);
 
-        // Log CDP response on first attempt for debugging
-        if (ctx.attempts == 1) {
-            if (std.fs.createFileAbsolute("/tmp/cmux-cdp-debug.log", .{ .truncate = false })) |dbg| {
-                defer dbg.close();
-                dbg.seekFromEnd(0) catch {};
-                const w = dbg.writer();
-                w.print("[cdp] looking for: {s}\n", .{ctx.url[0..ctx.url_len]}) catch {};
-                w.print("[cdp] response ({} bytes): {s}\n", .{ n, json[0..@min(n, 500)] }) catch {};
-            } else |_| {}
-        }
-
-        // Find our URL in the CDP response — match flexibly (URL may have trailing slash)
-        const url_str = ctx.url[0..ctx.url_len];
-        // Strip trailing slash for matching
-        const match_url = if (url_str.len > 0 and url_str[url_str.len - 1] == '/')
-            url_str[0 .. url_str.len - 1]
-        else
-            url_str;
-
-        if (std.mem.indexOf(u8, json, match_url)) |url_pos| {
-            // Search backwards for "id" field — handle both "id":"X" and "id": "X"
-            const before = json[0..url_pos];
-            const id_key = std.mem.lastIndexOf(u8, before, "\"id\":") orelse {
-                if (ctx.attempts >= 10) { std.heap.c_allocator.destroy(ctx); return 0; }
-                return 1;
-            };
-            // Skip "id": and any whitespace, find the opening quote
-            var id_scan = id_key + 5; // skip `"id":`
-            while (id_scan < json.len and (json[id_scan] == ' ' or json[id_scan] == '"')) : (id_scan += 1) {}
-            // Now id_scan points to first char of the ID value (we skipped the opening quote)
-            // Actually, let's just find the quotes properly
-            const after_key = json[id_key + 5 ..]; // after `"id":`
-            const quote1 = std.mem.indexOfScalar(u8, after_key, '"') orelse {
-                if (ctx.attempts >= 10) { std.heap.c_allocator.destroy(ctx); return 0; }
-                return 1;
-            };
-            const id_start_rel = quote1 + 1;
-            const id_content = after_key[id_start_rel..];
-            if (std.mem.indexOfScalar(u8, id_content, '"')) |id_end| {
-                const target_id = id_content[0..id_end];
-                log.info("CDP: found tab {s} for {s}", .{ target_id, url_str });
+                log.info("CDP: new tab {s} url={s}", .{ id_slice, url_slice });
 
                 if (ctx.pane) |pane| {
-                    storeBrowserTab(pane, target_id, url_str);
+                    // Use the actual browser URL (after redirect) for display
+                    const display_url = if (url_slice.len > 0) url_slice else ctx.url[0..ctx.url_len];
+                    storeBrowserTab(pane, id_slice, display_url);
                 }
 
                 std.heap.c_allocator.destroy(ctx);
@@ -580,11 +582,61 @@ pub const Pane = struct {
         }
 
         if (ctx.attempts >= 10) {
-            log.info("CDP: gave up finding tab for {s}", .{url_str});
+            log.info("CDP: gave up finding new tab", .{});
             std.heap.c_allocator.destroy(ctx);
             return 0;
         }
-        return 1; // keep polling
+        return 1;
+    }
+
+    fn snapshotCdpTabs(ids: *[64][64]u8, urls: *[64][256]u8, count: *usize) void {
+        count.* = 0;
+        const pid = std.posix.fork() catch return;
+        if (pid == 0) {
+            const argv = [_:null]?[*:0]const u8{
+                "curl", "-s", "-o", "/tmp/cmux-cdp.json",
+                "http://localhost:9222/json", null,
+            };
+            _ = std.posix.execvpeZ("curl", &argv, @ptrCast(std.c.environ)) catch {};
+            std.posix.exit(1);
+        }
+        _ = std.posix.waitpid(pid, 0);
+
+        const file = std.fs.openFileAbsolute("/tmp/cmux-cdp.json", .{}) catch return;
+        defer file.close();
+        var buf: [32768]u8 = undefined;
+        const n = file.read(&buf) catch return;
+        const json = buf[0..n];
+
+        // Extract "id" and "url" pairs from each entry
+        const id_needle = "\"id\": \"";
+        const url_needle = "\"url\": \"";
+        var pos: usize = 0;
+
+        while (count.* < 64) {
+            // Find next "id"
+            const id_pos = std.mem.indexOfPos(u8, json, pos, id_needle) orelse break;
+            const id_start = id_pos + id_needle.len;
+            const id_end = std.mem.indexOfScalarPos(u8, json, id_start, '"') orelse break;
+            const id = json[id_start..id_end];
+
+            // Find next "url" after this id
+            const url_pos = std.mem.indexOfPos(u8, json, id_end, url_needle) orelse break;
+            const url_start = url_pos + url_needle.len;
+            const url_end = std.mem.indexOfScalarPos(u8, json, url_start, '"') orelse break;
+            const url = json[url_start..url_end];
+
+            const ilen = @min(id.len, 63);
+            @memcpy(ids[count.*][0..ilen], id[0..ilen]);
+            ids[count.*][ilen] = 0;
+
+            const ulen = @min(url.len, 255);
+            @memcpy(urls[count.*][0..ulen], url[0..ulen]);
+            urls[count.*][ulen] = 0;
+
+            count.* += 1;
+            pos = url_end + 1;
+        }
     }
 
     fn storeBrowserTab(pane: *Pane, target_id: []const u8, url: []const u8) void {
