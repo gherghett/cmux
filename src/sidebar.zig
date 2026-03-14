@@ -58,6 +58,15 @@ pub const Sidebar = struct {
     pub fn connectTabManager(self: *Sidebar) void {
         self.tab_manager.on_change = &onTabManagerChange;
         self.tab_manager.on_change_data = self;
+
+        // Periodic refresh every 2 seconds for titles, CWDs, and state
+        _ = c.g_timeout_add(2000, @ptrCast(&onPeriodicRefresh), self);
+    }
+
+    fn onPeriodicRefresh(user_data: ?*anyopaque) callconv(.C) c.gboolean {
+        const self: *Sidebar = @ptrCast(@alignCast(user_data orelse return 0));
+        self.refresh();
+        return 1; // keep running
     }
 
     pub fn widget(self: *Sidebar) *c.GtkWidget {
