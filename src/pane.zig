@@ -528,25 +528,54 @@ pub const Pane = struct {
         };
         const json = buf[0..n];
 
-        // Find our URL in the CDP response and extract the target ID
+        // Log CDP response on first attempt for debugging
+        if (ctx.attempts == 1) {
+            if (std.fs.createFileAbsolute("/tmp/cmux-cdp-debug.log", .{ .truncate = false })) |dbg| {
+                defer dbg.close();
+                dbg.seekFromEnd(0) catch {};
+                const w = dbg.writer();
+                w.print("[cdp] looking for: {s}\n", .{ctx.url[0..ctx.url_len]}) catch {};
+                w.print("[cdp] response ({} bytes): {s}\n", .{ n, json[0..@min(n, 500)] }) catch {};
+            } else |_| {}
+        }
+
+        // Find our URL in the CDP response — match flexibly (URL may have trailing slash)
         const url_str = ctx.url[0..ctx.url_len];
-        if (std.mem.indexOf(u8, json, url_str)) |url_pos| {
-            // Search backwards for "id":" to find the target ID
+        // Strip trailing slash for matching
+        const match_url = if (url_str.len > 0 and url_str[url_str.len - 1] == '/')
+            url_str[0 .. url_str.len - 1]
+        else
+            url_str;
+
+        if (std.mem.indexOf(u8, json, match_url)) |url_pos| {
+            // Search backwards for "id" field — handle both "id":"X" and "id": "X"
             const before = json[0..url_pos];
-            if (std.mem.lastIndexOf(u8, before, "\"id\":\"")) |id_key_pos| {
-                const id_start = id_key_pos + 6; // skip `"id":"`
-                if (std.mem.indexOfScalarPos(u8, json, id_start, '"')) |id_end| {
-                    const target_id = json[id_start..id_end];
-                    log.info("CDP: found tab {s} for {s}", .{ target_id, url_str });
+            const id_key = std.mem.lastIndexOf(u8, before, "\"id\":") orelse {
+                if (ctx.attempts >= 10) { std.heap.c_allocator.destroy(ctx); return 0; }
+                return 1;
+            };
+            // Skip "id": and any whitespace, find the opening quote
+            var id_scan = id_key + 5; // skip `"id":`
+            while (id_scan < json.len and (json[id_scan] == ' ' or json[id_scan] == '"')) : (id_scan += 1) {}
+            // Now id_scan points to first char of the ID value (we skipped the opening quote)
+            // Actually, let's just find the quotes properly
+            const after_key = json[id_key + 5 ..]; // after `"id":`
+            const quote1 = std.mem.indexOfScalar(u8, after_key, '"') orelse {
+                if (ctx.attempts >= 10) { std.heap.c_allocator.destroy(ctx); return 0; }
+                return 1;
+            };
+            const id_start_rel = quote1 + 1;
+            const id_content = after_key[id_start_rel..];
+            if (std.mem.indexOfScalar(u8, id_content, '"')) |id_end| {
+                const target_id = id_content[0..id_end];
+                log.info("CDP: found tab {s} for {s}", .{ target_id, url_str });
 
-                    // Store on the pane's current tab and create overlay button
-                    if (ctx.pane) |pane| {
-                        storeBrowserTab(pane, target_id, url_str);
-                    }
-
-                    std.heap.c_allocator.destroy(ctx);
-                    return 0;
+                if (ctx.pane) |pane| {
+                    storeBrowserTab(pane, target_id, url_str);
                 }
+
+                std.heap.c_allocator.destroy(ctx);
+                return 0;
             }
         }
 
