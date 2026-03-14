@@ -101,7 +101,9 @@ pub const TabManager = struct {
             if (uuid.eql(&ws.id, id)) {
                 self.selected = i;
                 self.showSelected();
+                ws.markRead(); // clear unread indicator
                 ws.focus();
+                if (self.on_change) |cb| cb(self.on_change_data);
                 return true;
             }
         }
@@ -113,7 +115,9 @@ pub const TabManager = struct {
         if (index < self.workspaces.items.len) {
             self.selected = index;
             self.showSelected();
+            self.workspaces.items[index].markRead(); // clear unread indicator
             self.workspaces.items[index].focus();
+            if (self.on_change) |cb| cb(self.on_change_data);
         }
     }
 

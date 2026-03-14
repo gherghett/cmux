@@ -88,19 +88,31 @@ fn handleClaudeHook(args: [][*:0]u8) void {
     const ws_id = std.posix.getenv("CMUX_WORKSPACE_ID") orelse "";
     const surface_id = std.posix.getenv("CMUX_SURFACE_ID") orelse "";
 
-    // Read stdin (hook JSON payload) — we don't parse it fully for now
+    // Read stdin (hook JSON payload) — extract message if present
     var stdin_buf: [4096]u8 = undefined;
     const stdin_len = std.io.getStdIn().read(&stdin_buf) catch 0;
-    _ = stdin_len;
+    const stdin_data = stdin_buf[0..stdin_len];
+
+    // Try to extract a message from the hook JSON (look for "message" field)
+    const hook_message = extractJsonField(stdin_data, "message");
     _ = surface_id;
 
     if (std.mem.eql(u8, subcommand, "session-start") or std.mem.eql(u8, subcommand, "active")) {
-        // Claude started — set status to "Running"
+        // Claude started — set status to Running
         var cmd_buf: [512]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "set_status claude_code Running --tab={s}", .{ws_id}) catch return;
         _ = sendCommand(cmd) catch {};
     } else if (std.mem.eql(u8, subcommand, "stop") or std.mem.eql(u8, subcommand, "idle")) {
-        // Claude stopped — clear status + send notification
+        // Claude stopped — set message, clear status, notify
+
+        // Set the last message if we got one from notification, otherwise "Completed"
+        var msg_cmd_buf: [512]u8 = undefined;
+        const msg = if (hook_message) |m|
+            std.fmt.bufPrint(&msg_cmd_buf, "set_status claude_message {s} --tab={s}", .{ m, ws_id }) catch null
+        else
+            std.fmt.bufPrint(&msg_cmd_buf, "set_status claude_message Completed --tab={s}", .{ws_id}) catch null;
+        if (msg) |m| _ = sendCommand(m) catch {};
+
         var cmd_buf: [512]u8 = undefined;
         const clear = std.fmt.bufPrint(&cmd_buf, "clear_status claude_code --tab={s}", .{ws_id}) catch return;
         _ = sendCommand(clear) catch {};
@@ -109,10 +121,17 @@ fn handleClaudeHook(args: [][*:0]u8) void {
         const notify = std.fmt.bufPrint(&notify_buf, "notify Claude Code|Completed|Task finished", .{}) catch return;
         _ = sendCommand(notify) catch {};
     } else if (std.mem.eql(u8, subcommand, "notification") or std.mem.eql(u8, subcommand, "notify")) {
-        // Claude needs input — set status + notification
+        // Claude needs input — set status + message + notify
         var cmd_buf: [512]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "set_status claude_code Needs input --tab={s}", .{ws_id}) catch return;
         _ = sendCommand(cmd) catch {};
+
+        // Store the notification message as claude_message
+        if (hook_message) |m| {
+            var msg_buf: [512]u8 = undefined;
+            const msg_cmd = std.fmt.bufPrint(&msg_buf, "set_status claude_message {s} --tab={s}", .{ m, ws_id }) catch null;
+            if (msg_cmd) |mc| _ = sendCommand(mc) catch {};
+        }
 
         var notify_buf: [512]u8 = undefined;
         const notify = std.fmt.bufPrint(&notify_buf, "notify Claude Code|Needs input|Waiting for your response", .{}) catch return;
@@ -147,4 +166,40 @@ fn printUsage() void {
         \\  CMUX_SOCKET_PATH              Socket path (default: /tmp/cmux.sock)
         \\
     ) catch {};
+}
+
+/// Simple JSON field extractor — finds "key": "value" and returns value.
+/// No full JSON parser needed; just string matching for simple hook payloads.
+fn extractJsonField(json: []const u8, key: []const u8) ?[]const u8 {
+    // Search for "key": "value" or "key":"value"
+    var search_buf: [128]u8 = undefined;
+    const search = std.fmt.bufPrint(&search_buf, "\"{s}\"", .{key}) catch return null;
+
+    const key_pos = std.mem.indexOf(u8, json, search) orelse return null;
+    const after_key = key_pos + search.len;
+    if (after_key >= json.len) return null;
+
+    // Skip whitespace and colon
+    var pos = after_key;
+    while (pos < json.len and (json[pos] == ' ' or json[pos] == ':' or json[pos] == '\t')) : (pos += 1) {}
+    if (pos >= json.len) return null;
+
+    // Expect opening quote
+    if (json[pos] != '"') return null;
+    pos += 1;
+
+    // Find closing quote (handle escaped quotes)
+    const start = pos;
+    while (pos < json.len) : (pos += 1) {
+        if (json[pos] == '\\') {
+            pos += 1; // skip escaped char
+            continue;
+        }
+        if (json[pos] == '"') break;
+    }
+    if (pos >= json.len) return null;
+
+    const value = json[start..pos];
+    // Truncate to reasonable display length
+    return value[0..@min(value.len, 200)];
 }

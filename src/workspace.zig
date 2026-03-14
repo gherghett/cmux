@@ -20,13 +20,36 @@ pub const Workspace = struct {
     container: *c.GtkBox,
     allocator: std.mem.Allocator,
     socket_path: []const u8,
-    status_entries: [8]?StatusEntry = [_]?StatusEntry{null} ** 8,
 
-    pub const StatusEntry = struct {
-        key: [64]u8,
-        key_len: usize,
-        value: [128]u8,
-        value_len: usize,
+    /// Claude Code status for sidebar indicator.
+    ///
+    ///  State machine:
+    ///
+    ///                session-start
+    ///    [none] ──────────────────► [running ✦]
+    ///      ▲                           │  │
+    ///      │ select tab                │  │ notification
+    ///      │ (if unread)               │  └────────► [attention ● purple]
+    ///      │                           │                   │
+    ///      │    stop (active tab)      │                   │ stop (active)
+    ///      │◄──────────────────────────┘                   │◄──────────
+    ///      │                                               │
+    ///      │    stop (inactive tab)                        │ stop (inactive)
+    ///      │    ┌────────────┐◄────────────────────────────┘
+    ///      │    │ unread ● blue │◄──────────────────────────
+    ///      │    └─────┬──────┘
+    ///      │          │ select tab
+    ///      └──────────┘
+    ///
+    claude_status: ClaudeStatus = .none,
+    claude_message: [256]u8 = undefined,
+    claude_message_len: usize = 0,
+
+    pub const ClaudeStatus = enum {
+        none,      // no indicator
+        running,   // ✦ star
+        unread,    // ● blue dot (finished, tab not yet viewed)
+        attention, // ● purple dot (needs input/permission)
     };
 
     pub fn init(allocator: std.mem.Allocator, socket_path: []const u8) !*Workspace {
@@ -93,49 +116,37 @@ pub const Workspace = struct {
         return self.title[0..self.title_len];
     }
 
-    /// Get the status string for sidebar display (e.g., "⚡ Running")
-    pub fn statusText(self: *const Workspace) ?[]const u8 {
-        for (self.status_entries) |entry_opt| {
-            if (entry_opt) |entry| {
-                return entry.value[0..entry.value_len];
-            }
-        }
-        return null;
+    /// Set Claude Code status (dedicated state machine).
+    pub fn setClaudeStatus(self: *Workspace, status: ClaudeStatus) void {
+        self.claude_status = status;
     }
 
-    pub fn setStatus(self: *Workspace, key: []const u8, value: []const u8) void {
-        // Find existing or first empty slot
-        var slot: ?usize = null;
-        for (self.status_entries, 0..) |entry_opt, i| {
-            if (entry_opt) |entry| {
-                if (std.mem.eql(u8, entry.key[0..entry.key_len], key)) {
-                    slot = i;
-                    break;
-                }
-            } else if (slot == null) {
-                slot = i;
-            }
+    /// Clear Claude status: transitions to .unread if tab not active, .none if active.
+    pub fn clearClaudeStatus(self: *Workspace, is_active: bool) void {
+        if (self.claude_status == .running or self.claude_status == .attention) {
+            self.claude_status = if (is_active) .none else .unread;
+        } else {
+            self.claude_status = .none;
         }
-        const idx = slot orelse return;
-
-        var entry = StatusEntry{
-            .key = undefined, .key_len = @min(key.len, 64),
-            .value = undefined, .value_len = @min(value.len, 128),
-        };
-        @memcpy(entry.key[0..entry.key_len], key[0..entry.key_len]);
-        @memcpy(entry.value[0..entry.value_len], value[0..entry.value_len]);
-        self.status_entries[idx] = entry;
     }
 
-    pub fn clearStatus(self: *Workspace, key: []const u8) void {
-        for (self.status_entries, 0..) |entry_opt, i| {
-            if (entry_opt) |entry| {
-                if (std.mem.eql(u8, entry.key[0..entry.key_len], key)) {
-                    self.status_entries[i] = null;
-                    return;
-                }
-            }
+    /// Mark as read when workspace is selected.
+    pub fn markRead(self: *Workspace) void {
+        if (self.claude_status == .unread) {
+            self.claude_status = .none;
         }
+    }
+
+    /// Set Claude's latest message preview for sidebar row 2.
+    pub fn setClaudeMessage(self: *Workspace, message: []const u8) void {
+        self.claude_message_len = @min(message.len, 256);
+        @memcpy(self.claude_message[0..self.claude_message_len], message[0..self.claude_message_len]);
+    }
+
+    /// Get Claude message preview, or null if empty.
+    pub fn claudeMessage(self: *const Workspace) ?[]const u8 {
+        if (self.claude_message_len == 0) return null;
+        return self.claude_message[0..self.claude_message_len];
     }
 
     pub fn setTitle(self: *Workspace, title: []const u8) void {

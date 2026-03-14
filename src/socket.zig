@@ -451,11 +451,21 @@ pub const SocketServer = struct {
         }
 
         const ws = target_ws orelse self.tab_manager.current() orelse return "ERROR: no workspace";
-        ws.setStatus(key, value_buf[0..value_len]);
+        const value = value_buf[0..value_len];
 
-        // Trigger sidebar refresh
+        // Route claude_code and claude_message through dedicated API
+        if (std.mem.eql(u8, key, "claude_code")) {
+            if (std.mem.eql(u8, value, "Running")) {
+                ws.setClaudeStatus(.running);
+            } else {
+                // "Needs input", "Permission", etc. → attention
+                ws.setClaudeStatus(.attention);
+            }
+        } else if (std.mem.eql(u8, key, "claude_message")) {
+            ws.setClaudeMessage(value);
+        }
+
         if (self.tab_manager.on_change) |cb| cb(self.tab_manager.on_change_data);
-
         return "OK";
     }
 
@@ -464,7 +474,6 @@ pub const SocketServer = struct {
         const key = iter.first();
         if (key.len == 0) return "ERROR: missing key";
 
-        // Check for --tab= flag
         var target_ws: ?*Workspace = null;
         while (iter.next()) |part| {
             if (std.mem.startsWith(u8, part, "--tab=")) {
@@ -478,10 +487,14 @@ pub const SocketServer = struct {
         }
 
         const ws = target_ws orelse self.tab_manager.current() orelse return "ERROR: no workspace";
-        ws.clearStatus(key);
+
+        if (std.mem.eql(u8, key, "claude_code")) {
+            // Transition to unread if not active, none if active
+            const is_active = (self.tab_manager.current() == ws);
+            ws.clearClaudeStatus(is_active);
+        }
 
         if (self.tab_manager.on_change) |cb| cb(self.tab_manager.on_change_data);
-
         return "OK";
     }
 

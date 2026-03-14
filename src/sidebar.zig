@@ -4,11 +4,19 @@ const c = cc.c;
 const asWidget = cc.asWidget;
 const uuid = @import("uuid.zig");
 const TabManager = @import("tab_manager.zig").TabManager;
+const Workspace = @import("workspace.zig").Workspace;
+const Pane = @import("pane.zig").Pane;
 
 const log = std.log.scoped(.sidebar);
 
-/// Vertical sidebar showing the list of workspaces.
-/// Each row shows the workspace title and notification badge.
+/// Vertical sidebar showing workspaces as rich 3-row tabs.
+///
+///   ┌─────────────────────────────┐
+///   │ ✦ My Project                │  Row 1: indicator + title
+///   │ Fixed the auth bug and...   │  Row 2: Claude message (dim)
+///   │ ~/proj  ~/dotfiles          │  Row 3: pane CWDs (dim)
+///   └─────────────────────────────┘
+///
 pub const Sidebar = struct {
     list_box: *c.GtkListBox,
     scrolled: *c.GtkScrolledWindow,
@@ -25,10 +33,8 @@ pub const Sidebar = struct {
         c.gtk_scrolled_window_set_child(scrolled, asWidget(list_box));
         c.gtk_scrolled_window_set_policy(scrolled, c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
 
-        // Set a minimum width for the sidebar
-        c.gtk_widget_set_size_request(asWidget(scrolled), 160, -1);
+        c.gtk_widget_set_size_request(asWidget(scrolled), 200, -1);
 
-        // Connect row-activated for workspace selection
         _ = c.g_signal_connect_data(
             @ptrCast(list_box),
             "row-activated",
@@ -44,93 +50,159 @@ pub const Sidebar = struct {
             .tab_manager = tab_manager,
         };
 
-        // Initial refresh
         sidebar.refresh();
-
         return sidebar;
     }
 
-    /// Must be called after the Sidebar is stored at its final heap location.
-    /// Wires up the tab manager change callback to this sidebar instance.
     pub fn connectTabManager(self: *Sidebar) void {
         self.tab_manager.on_change = &onTabManagerChange;
         self.tab_manager.on_change_data = self;
     }
 
-    /// Returns the widget for embedding in the window layout
     pub fn widget(self: *Sidebar) *c.GtkWidget {
         return asWidget(self.scrolled);
     }
 
-    /// Rebuild the sidebar list from the tab manager's workspaces
+    /// Rebuild the sidebar from workspace state.
     pub fn refresh(self: *Sidebar) void {
         // Remove all existing rows
         while (c.gtk_list_box_get_row_at_index(self.list_box, 0)) |row| {
             c.gtk_list_box_remove(self.list_box, asWidget(row));
         }
 
-        // Add a row for each workspace
         for (self.tab_manager.workspaces.items, 0..) |ws, i| {
-            // Use vertical box for title + status
             const row_box: *c.GtkBox = @ptrCast(@alignCast(
-                c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2) orelse continue,
+                c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 1) orelse continue,
             ));
 
-            // Title label
+            // === Row 1: Indicator + Title ===
+            const title_row: *c.GtkBox = @ptrCast(@alignCast(
+                c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4) orelse continue,
+            ));
+
+            // Status indicator
+            const indicator = getIndicator(ws.claude_status);
+            if (indicator.text) |ind_text| {
+                const ind_label = c.gtk_label_new(ind_text) orelse continue;
+                if (indicator.css_class) |css| {
+                    c.gtk_widget_add_css_class(ind_label, css);
+                }
+                c.gtk_box_append(title_row, ind_label);
+            }
+
+            // Title
             var title_buf: [257]u8 = undefined;
             const title = ws.displayTitle();
             const tlen = @min(title.len, 256);
             @memcpy(title_buf[0..tlen], title[0..tlen]);
             title_buf[tlen] = 0;
-            const label = c.gtk_label_new(&title_buf) orelse continue;
-            c.gtk_label_set_xalign(@ptrCast(@alignCast(label)), 0);
-            c.gtk_widget_set_hexpand(label, 1);
-            c.gtk_box_append(row_box, label);
+            const title_label = c.gtk_label_new(&title_buf) orelse continue;
+            c.gtk_label_set_xalign(@ptrCast(@alignCast(title_label)), 0);
+            c.gtk_widget_set_hexpand(title_label, 1);
+            c.gtk_label_set_ellipsize(@ptrCast(@alignCast(title_label)), c.PANGO_ELLIPSIZE_END);
+            c.gtk_box_append(title_row, title_label);
 
-            // Status text (e.g., "⚡ Running" from Claude Code)
-            if (ws.statusText()) |status| {
-                var status_buf: [130]u8 = undefined;
-                const slen = @min(status.len, 129);
-                @memcpy(status_buf[0..slen], status[0..slen]);
-                status_buf[slen] = 0;
-                const status_label = c.gtk_label_new(&status_buf) orelse continue;
-                c.gtk_label_set_xalign(@ptrCast(@alignCast(status_label)), 0);
-                c.gtk_widget_add_css_class(status_label, "dim-label");
-                c.gtk_box_append(row_box, status_label);
+            c.gtk_box_append(row_box, asWidget(title_row));
+
+            // === Row 2: Claude message preview ===
+            if (ws.claudeMessage()) |msg| {
+                var msg_buf: [257]u8 = undefined;
+                const mlen = @min(msg.len, 256);
+                // Replace newlines with spaces
+                for (0..mlen) |j| {
+                    msg_buf[j] = if (msg[j] == '\n' or msg[j] == '\r') ' ' else msg[j];
+                }
+                msg_buf[mlen] = 0;
+                const msg_label = c.gtk_label_new(&msg_buf) orelse continue;
+                c.gtk_label_set_xalign(@ptrCast(@alignCast(msg_label)), 0);
+                c.gtk_label_set_ellipsize(@ptrCast(@alignCast(msg_label)), c.PANGO_ELLIPSIZE_END);
+                c.gtk_widget_add_css_class(msg_label, "dim-label");
+                c.gtk_widget_add_css_class(msg_label, "caption");
+                c.gtk_box_append(row_box, msg_label);
             }
 
-            // Notification badge (if any)
-            if (ws.notification_count > 0) {
-                const hbox: *c.GtkBox = @ptrCast(@alignCast(
-                    c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4) orelse continue,
-                ));
-                var badge_buf: [16]u8 = undefined;
-                const badge_text = std.fmt.bufPrint(&badge_buf, "{}", .{ws.notification_count}) catch continue;
-                var badge_z: [17]u8 = undefined;
-                @memcpy(badge_z[0..badge_text.len], badge_text);
-                badge_z[badge_text.len] = 0;
-                const badge = c.gtk_label_new(&badge_z);
-                c.gtk_widget_add_css_class(badge, "badge");
-                c.gtk_box_append(hbox, badge);
-                c.gtk_box_append(row_box, asWidget(hbox));
+            // === Row 3: Pane CWDs ===
+            var cwd_text_buf: [512]u8 = undefined;
+            const cwd_text = self.buildCwdText(ws, &cwd_text_buf);
+            if (cwd_text.len > 0) {
+                var cwd_z: [513]u8 = undefined;
+                @memcpy(cwd_z[0..cwd_text.len], cwd_text);
+                cwd_z[cwd_text.len] = 0;
+                const cwd_label = c.gtk_label_new(&cwd_z) orelse continue;
+                c.gtk_label_set_xalign(@ptrCast(@alignCast(cwd_label)), 0);
+                c.gtk_label_set_ellipsize(@ptrCast(@alignCast(cwd_label)), c.PANGO_ELLIPSIZE_END);
+                c.gtk_widget_add_css_class(cwd_label, "dim-label");
+                c.gtk_widget_add_css_class(cwd_label, "caption");
+                c.gtk_box_append(row_box, cwd_label);
             }
 
-            // Add padding to the row
+            // Row padding
             const row_w = asWidget(row_box);
             c.gtk_widget_set_margin_start(row_w, 8);
             c.gtk_widget_set_margin_end(row_w, 8);
-            c.gtk_widget_set_margin_top(row_w, 4);
-            c.gtk_widget_set_margin_bottom(row_w, 4);
+            c.gtk_widget_set_margin_top(row_w, 6);
+            c.gtk_widget_set_margin_bottom(row_w, 6);
 
             c.gtk_list_box_append(self.list_box, row_w);
 
-            // Select the current workspace row
+            // Select current workspace
             if (i == self.tab_manager.selected) {
                 if (c.gtk_list_box_get_row_at_index(self.list_box, @intCast(i))) |row| {
                     c.gtk_list_box_select_row(self.list_box, row);
                 }
             }
         }
+    }
+
+    const Indicator = struct {
+        text: ?[*:0]const u8,
+        css_class: ?[*:0]const u8,
+    };
+
+    fn getIndicator(status: Workspace.ClaudeStatus) Indicator {
+        return switch (status) {
+            .none => .{ .text = null, .css_class = null },
+            .running => .{ .text = "✦", .css_class = null },
+            .unread => .{ .text = "●", .css_class = "accent" }, // blue
+            .attention => .{ .text = "●", .css_class = "warning" }, // purple/orange
+        };
+    }
+
+    fn buildCwdText(self: *Sidebar, ws: *Workspace, buf: []u8) []const u8 {
+        var pane_list = std.ArrayList(*Pane).init(self.tab_manager.allocator);
+        defer pane_list.deinit();
+        ws.allPanes(&pane_list) catch return "";
+
+        const home = std.posix.getenv("HOME") orelse "";
+
+        var pos: usize = 0;
+        for (pane_list.items) |pane| {
+            const cwd_ptr = pane.getCwd() orelse continue;
+            const cwd = std.mem.span(cwd_ptr);
+            if (cwd.len == 0) continue;
+
+            if (pos > 0 and pos + 2 < buf.len) {
+                buf[pos] = ' ';
+                buf[pos + 1] = ' ';
+                pos += 2;
+            }
+
+            // Shorten: replace $HOME with ~
+            const display = if (home.len > 0 and std.mem.startsWith(u8, cwd, home))
+                cwd[home.len..]
+            else
+                cwd;
+
+            const prefix = if (home.len > 0 and std.mem.startsWith(u8, cwd, home)) "~" else "";
+            const total = prefix.len + display.len;
+
+            if (pos + total >= buf.len) break;
+            @memcpy(buf[pos..][0..prefix.len], prefix);
+            @memcpy(buf[pos + prefix.len ..][0..display.len], display);
+            pos += total;
+        }
+
+        return buf[0..pos];
     }
 
     fn onRowActivated(
