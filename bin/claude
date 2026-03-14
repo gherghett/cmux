@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# cmux-linux claude wrapper — injects hooks for status/notification integration.
+#
+# When running inside cmux (CMUX_SURFACE_ID is set), intercepts `claude`
+# invocations to inject hooks so Claude Code reports status back to cmux.
+
+find_real_claude() {
+    local self_dir
+    self_dir="$(cd "$(dirname "$0")" && pwd)"
+    local IFS=:
+    for d in $PATH; do
+        [[ "$d" == "$self_dir" ]] && continue
+        [[ -x "$d/claude" ]] && printf '%s' "$d/claude" && return 0
+    done
+    return 1
+}
+
+# Pass through if not in cmux or hooks disabled
+if [[ -z "$CMUX_SURFACE_ID" || "$CMUX_CLAUDE_HOOKS_DISABLED" == "1" ]]; then
+    REAL_CLAUDE="$(find_real_claude)" || { echo "Error: claude not found in PATH" >&2; exit 127; }
+    exec "$REAL_CLAUDE" "$@"
+fi
+
+# Check cmux socket is alive
+CLI="$(dirname "$0")/cmux-cli"
+if [[ ! -x "$CLI" ]]; then
+    CLI="$(command -v cmux-cli || true)"
+fi
+if [[ -z "$CLI" ]] || ! "$CLI" ping >/dev/null 2>&1; then
+    REAL_CLAUDE="$(find_real_claude)" || { echo "Error: claude not found in PATH" >&2; exit 127; }
+    exec "$REAL_CLAUDE" "$@"
+fi
+
+REAL_CLAUDE="$(find_real_claude)" || { echo "Error: claude not found in PATH" >&2; exit 127; }
+
+# Pass through subcommands that don't support hooks
+case "${1:-}" in
+    mcp|config|api-key) exec "$REAL_CLAUDE" "$@" ;;
+esac
+
+# Unset CLAUDECODE to avoid nested session detection
+unset CLAUDECODE
+
+# Check if user already specified session flags
+SKIP_SESSION_ID=false
+for arg in "$@"; do
+    case "$arg" in
+        --resume|--resume=*|--session-id|--session-id=*|--continue|-c)
+            SKIP_SESSION_ID=true
+            break
+            ;;
+    esac
+done
+
+# Build hooks JSON — these call cmux-cli claude-hook which sends socket commands
+HOOKS_JSON='{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"cmux-cli claude-hook session-start","timeout":10}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"cmux-cli claude-hook stop","timeout":10}]}],"Notification":[{"matcher":"","hooks":[{"type":"command","command":"cmux-cli claude-hook notification","timeout":10}]}]}}'
+
+if [[ "$SKIP_SESSION_ID" == true ]]; then
+    exec "$REAL_CLAUDE" --settings "$HOOKS_JSON" "$@"
+else
+    SESSION_ID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]')"
+    exec "$REAL_CLAUDE" --session-id "$SESSION_ID" --settings "$HOOKS_JSON" "$@"
+fi

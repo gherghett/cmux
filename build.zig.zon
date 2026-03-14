@@ -1,0 +1,6 @@
+.{
+    .name = .cmux_linux,
+    .version = "0.1.0",
+    .fingerprint = 0xe6aaba3e92dc1a38,
+    .paths = .{""},
+}
