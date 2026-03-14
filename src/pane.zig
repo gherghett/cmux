@@ -699,23 +699,25 @@ pub const Pane = struct {
 
         log.info("CDP: activating tab {s}", .{tid});
 
-        // GET http://localhost:9222/json/activate/{target_id}
-        var activate_url: [256]u8 = undefined;
-        const url = std.fmt.bufPrint(&activate_url, "http://localhost:9222/json/activate/{s}", .{tid}) catch return;
-        var url_z: [257]u8 = undefined;
-        @memcpy(url_z[0..url.len], url);
-        url_z[url.len] = 0;
+        // Activate the tab via CDP + raise the browser window via xdotool
+        var script_buf: [512]u8 = undefined;
+        const script = std.fmt.bufPrint(&script_buf,
+            "curl -s http://localhost:9222/json/activate/{s} >/dev/null; xdotool search --name 'Brave' windowactivate 2>/dev/null",
+            .{tid},
+        ) catch return;
+        var script_z: [513]u8 = undefined;
+        @memcpy(script_z[0..script.len], script);
+        script_z[script.len] = 0;
 
         const pid = std.posix.fork() catch return;
         if (pid == 0) {
             const argv = [_:null]?[*:0]const u8{
-                "curl", "-s", url_z[0..url.len :0],
+                "sh", "-c", script_z[0..script.len :0],
                 null,
             };
-            _ = std.posix.execvpeZ("curl", &argv, @ptrCast(std.c.environ)) catch {};
+            _ = std.posix.execvpeZ("sh", &argv, @ptrCast(std.c.environ)) catch {};
             std.posix.exit(1);
         }
-        // Don't wait — fire and forget
     }
 
     // --- Signal handlers ---
