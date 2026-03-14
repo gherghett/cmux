@@ -425,22 +425,18 @@ pub const Pane = struct {
     }
 
     fn openUrlAndTrack(url: []const u8) void {
-        // Open URL in browser via xdg-open
+        // Open URL via GLib's launcher (handles focus correctly)
         var url_z: [2048]u8 = undefined;
         const ulen = @min(url.len, 2047);
         @memcpy(url_z[0..ulen], url[0..ulen]);
         url_z[ulen] = 0;
 
-        const pid = std.posix.fork() catch return;
-        if (pid == 0) {
-            // Child: exec xdg-open
-            const argv = [_:null]?[*:0]const u8{
-                "xdg-open",
-                url_z[0..ulen :0],
-                null,
-            };
-            _ = std.posix.execvpeZ("xdg-open", &argv, @ptrCast(std.c.environ)) catch {};
-            std.posix.exit(1);
+        var err: ?*c.GError = null;
+        _ = c.g_app_info_launch_default_for_uri(&url_z, null, &err);
+        if (err) |e| {
+            log.err("failed to open URL: {s}", .{@as([*:0]const u8, @ptrCast(e.message))});
+            c.g_error_free(e);
+            return;
         }
 
         // After opening, poll CDP to find the new tab
