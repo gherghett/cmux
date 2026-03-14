@@ -34,6 +34,7 @@ pub const Sidebar = struct {
         c.gtk_scrolled_window_set_policy(scrolled, c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
 
         c.gtk_widget_set_size_request(asWidget(scrolled), 200, -1);
+        c.gtk_widget_set_vexpand(asWidget(scrolled), 1);
 
         _ = c.g_signal_connect_data(
             @ptrCast(list_box),
