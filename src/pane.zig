@@ -31,6 +31,13 @@ pub const Pane = struct {
         id: uuid.Uuid,
         terminal: *c.VteTerminal,
         label: *c.GtkLabel,
+        overlay: *c.GtkOverlay,
+        /// Tracked browser tab for this terminal (if any)
+        browser_target_id: [64]u8 = undefined,
+        browser_target_id_len: usize = 0,
+        browser_url: [256]u8 = undefined,
+        browser_url_len: usize = 0,
+        browser_button: ?*c.GtkWidget = null,
     };
 
     pub fn init(
@@ -81,14 +88,22 @@ pub const Pane = struct {
         c.gtk_widget_set_vexpand(asWidget(terminal), 1);
         c.gtk_widget_set_hexpand(asWidget(terminal), 1);
 
+        // Wrap terminal in GtkOverlay for floating browser-tab buttons
+        const overlay: *c.GtkOverlay = @ptrCast(@alignCast(
+            c.gtk_overlay_new() orelse return error.GtkWidgetCreateFailed,
+        ));
+        c.gtk_overlay_set_child(overlay, asWidget(terminal));
+        c.gtk_widget_set_vexpand(asWidget(overlay), 1);
+        c.gtk_widget_set_hexpand(asWidget(overlay), 1);
+
         const label: *c.GtkLabel = @ptrCast(@alignCast(
             c.gtk_label_new("Terminal") orelse return error.GtkWidgetCreateFailed,
         ));
 
-        // Add to notebook
+        // Add overlay (not bare terminal) to notebook
         const page_num = c.gtk_notebook_append_page(
             self.notebook,
-            asWidget(terminal),
+            asWidget(overlay),
             asWidget(label),
         );
         if (page_num < 0) return error.NotebookAppendFailed;
@@ -102,6 +117,7 @@ pub const Pane = struct {
             .id = tab_id,
             .terminal = terminal,
             .label = label,
+            .overlay = overlay,
         });
         const tab = &self.tabs.items[self.tabs.items.len - 1];
 
@@ -138,7 +154,7 @@ pub const Pane = struct {
         c.gtk_widget_add_controller(asWidget(terminal), focus_controller);
 
         // URL matching: make URLs clickable
-        setupUrlMatching(terminal);
+        setupUrlMatching(terminal, self);
 
         // Spawn shell
         self.spawnShell(terminal, cwd);
@@ -272,7 +288,15 @@ pub const Pane = struct {
         // Disconnect signals from this terminal to prevent re-entrant callbacks
         _ = c.g_signal_handlers_disconnect_matched(@as(c.gpointer, @ptrCast(@alignCast(terminal))), c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @as(c.gpointer, @ptrCast(self)));
 
-        const page_num = c.gtk_notebook_page_num(self.notebook, asWidget(terminal));
+        // Find the overlay (notebook page) for this terminal
+        var page_widget: *c.GtkWidget = asWidget(terminal);
+        for (self.tabs.items) |tab| {
+            if (tab.terminal == terminal) {
+                page_widget = asWidget(tab.overlay);
+                break;
+            }
+        }
+        const page_num = c.gtk_notebook_page_num(self.notebook, page_widget);
         if (page_num >= 0) {
             c.gtk_notebook_remove_page(self.notebook, page_num);
         }
@@ -369,7 +393,7 @@ pub const Pane = struct {
 
     // --- URL matching ---
 
-    fn setupUrlMatching(terminal: *c.VteTerminal) void {
+    fn setupUrlMatching(terminal: *c.VteTerminal, pane: *Pane) void {
         // URL regex pattern: matches http(s), localhost, and common URLs
         const url_pattern = "https?://[\\w\\-.]+(:\\d+)?(/[\\w\\-.~:/?#\\[\\]@!$&'()*+,;=%]*)?";
         var err: ?*c.GError = null;
@@ -386,6 +410,9 @@ pub const Pane = struct {
         // Handle clicks via a GtkGestureClick on the terminal
         const click = c.gtk_gesture_click_new() orelse return;
         c.gtk_gesture_single_set_button(@ptrCast(@alignCast(click)), 1); // left click
+
+        // Store pane pointer on terminal for click handler
+        c.g_object_set_data(@ptrCast(@alignCast(terminal)), "cmux-pane", pane);
 
         _ = c.g_signal_connect_data(
             @ptrCast(click),
@@ -405,13 +432,10 @@ pub const Pane = struct {
         y: c.gdouble,
         terminal: *c.VteTerminal,
     ) callconv(.C) void {
-        // Check if click is on a URL (Ctrl+Click)
-        // First check for OSC 8 hyperlinks
         var url: ?[*:0]u8 = null;
 
         url = c.vte_terminal_check_hyperlink_at(terminal, x, y);
         if (url == null) {
-            // Check regex-matched URLs
             var tag: c_int = 0;
             url = c.vte_terminal_check_match_at(terminal, x, y, &tag);
         }
@@ -419,19 +443,23 @@ pub const Pane = struct {
         if (url) |u| {
             const url_str = std.mem.span(u);
             log.info("URL clicked: {s}", .{url_str});
-            openUrlAndTrack(url_str);
+
+            // Get the pane from the terminal
+            const pane_raw = c.g_object_get_data(@ptrCast(@alignCast(terminal)), "cmux-pane");
+            const pane: ?*Pane = if (pane_raw) |p| @ptrCast(@alignCast(p)) else null;
+
+            openUrlAndTrack(url_str, terminal, pane);
             c.g_free(u);
         }
     }
 
-    fn openUrlAndTrack(url: []const u8) void {
-        // Open URL via GLib's launcher (handles focus correctly)
+    fn openUrlAndTrack(url: []const u8, terminal: *c.VteTerminal, pane: ?*Pane) void {
         var url_z: [2048]u8 = undefined;
         const ulen = @min(url.len, 2047);
         @memcpy(url_z[0..ulen], url[0..ulen]);
         url_z[ulen] = 0;
 
-        // Get the display's launch context so the WM gives focus to the browser
+        // Open URL via GLib launcher with display context for focus
         const display = c.gdk_display_get_default();
         const launch_ctx: ?*c.GAppLaunchContext = if (display) |d|
             @ptrCast(@alignCast(c.gdk_display_get_app_launch_context(d)))
@@ -447,15 +475,15 @@ pub const Pane = struct {
             return;
         }
 
-        // After opening, poll CDP to find the new tab
-        // Use a GLib timeout to check after a delay (give browser time to open the tab)
+        // Poll CDP to find the new browser tab
         const ctx = std.heap.c_allocator.create(CdpPollCtx) catch return;
         ctx.url_len = ulen;
         @memcpy(ctx.url[0..ulen], url[0..ulen]);
         ctx.url[ulen] = 0;
         ctx.attempts = 0;
+        ctx.terminal = terminal;
+        ctx.pane = pane;
 
-        // Poll every 500ms for up to 5 seconds
         _ = c.g_timeout_add(500, @ptrCast(&onCdpPoll), ctx);
     }
 
@@ -463,59 +491,150 @@ pub const Pane = struct {
         url: [2048]u8,
         url_len: usize,
         attempts: u8,
+        terminal: *c.VteTerminal,
+        pane: ?*Pane,
     };
 
     fn onCdpPoll(user_data: ?*anyopaque) callconv(.C) c.gboolean {
         const ctx: *CdpPollCtx = @ptrCast(@alignCast(user_data orelse return 0));
         ctx.attempts += 1;
 
-        // Try to find the tab via CDP
-        const target_id = findCdpTab(ctx.url[0..ctx.url_len]);
-        if (target_id != null) {
-            log.info("CDP: found tab for URL, tracking", .{});
-            // TODO: store the tab on the workspace for sidebar display
-            std.heap.c_allocator.destroy(ctx);
-            return 0; // stop polling
-        }
-
-        if (ctx.attempts >= 10) {
-            // Give up after 5 seconds
+        // Shell out to curl to query CDP
+        const pid = std.posix.fork() catch {
             std.heap.c_allocator.destroy(ctx);
             return 0;
-        }
-
-        return 1; // keep polling
-    }
-
-    fn findCdpTab(url: []const u8) ?[]const u8 {
-        // Shell out to curl to query CDP
-        const pid = std.posix.fork() catch return null;
+        };
         if (pid == 0) {
-            // Child: curl -s http://localhost:9222/json > /tmp/cmux-cdp-tabs.json
             const argv = [_:null]?[*:0]const u8{
-                "curl", "-s", "-o", "/tmp/cmux-cdp-tabs.json",
+                "curl", "-s", "-o", "/tmp/cmux-cdp.json",
                 "http://localhost:9222/json",
                 null,
             };
             _ = std.posix.execvpeZ("curl", &argv, @ptrCast(std.c.environ)) catch {};
             std.posix.exit(1);
         }
-
-        // Wait for curl
         _ = std.posix.waitpid(pid, 0);
 
-        // Read the result and search for our URL
-        const file = std.fs.openFileAbsolute("/tmp/cmux-cdp-tabs.json", .{}) catch return null;
+        // Read and search for the URL
+        const file = std.fs.openFileAbsolute("/tmp/cmux-cdp.json", .{}) catch {
+            if (ctx.attempts >= 10) { std.heap.c_allocator.destroy(ctx); return 0; }
+            return 1;
+        };
         defer file.close();
-        var buf: [8192]u8 = undefined;
-        const n = file.read(&buf) catch return null;
+        var buf: [16384]u8 = undefined;
+        const n = file.read(&buf) catch {
+            if (ctx.attempts >= 10) { std.heap.c_allocator.destroy(ctx); return 0; }
+            return 1;
+        };
         const json = buf[0..n];
 
-        // Simple search: find "url":"<our_url>" nearby a "id":"<target_id>"
-        if (std.mem.indexOf(u8, json, url)) |_| {
-            return url; // Found it — for now just confirm it exists
+        // Find our URL in the CDP response and extract the target ID
+        const url_str = ctx.url[0..ctx.url_len];
+        if (std.mem.indexOf(u8, json, url_str)) |url_pos| {
+            // Search backwards for "id":" to find the target ID
+            const before = json[0..url_pos];
+            if (std.mem.lastIndexOf(u8, before, "\"id\":\"")) |id_key_pos| {
+                const id_start = id_key_pos + 6; // skip `"id":"`
+                if (std.mem.indexOfScalarPos(u8, json, id_start, '"')) |id_end| {
+                    const target_id = json[id_start..id_end];
+                    log.info("CDP: found tab {s} for {s}", .{ target_id, url_str });
+
+                    // Store on the pane's current tab and create overlay button
+                    if (ctx.pane) |pane| {
+                        storeBrowserTab(pane, target_id, url_str);
+                    }
+
+                    std.heap.c_allocator.destroy(ctx);
+                    return 0;
+                }
+            }
         }
-        return null;
+
+        if (ctx.attempts >= 10) {
+            log.info("CDP: gave up finding tab for {s}", .{url_str});
+            std.heap.c_allocator.destroy(ctx);
+            return 0;
+        }
+        return 1; // keep polling
+    }
+
+    fn storeBrowserTab(pane: *Pane, target_id: []const u8, url: []const u8) void {
+        const tab = pane.currentTab() orelse return;
+
+        // Store the target ID
+        const tid_len = @min(target_id.len, 64);
+        @memcpy(tab.browser_target_id[0..tid_len], target_id[0..tid_len]);
+        tab.browser_target_id_len = tid_len;
+
+        const url_len = @min(url.len, 256);
+        @memcpy(tab.browser_url[0..url_len], url[0..url_len]);
+        tab.browser_url_len = url_len;
+
+        // Create overlay button in bottom-right
+        if (tab.browser_button != null) {
+            // Remove old button
+            c.gtk_overlay_remove_overlay(tab.overlay, tab.browser_button.?);
+        }
+
+        // Shorten URL for display
+        var display_buf: [64]u8 = undefined;
+        const display = if (url_len > 50)
+            std.fmt.bufPrint(&display_buf, "🌐 {s}...", .{url[0..47]}) catch url[0..url_len]
+        else
+            std.fmt.bufPrint(&display_buf, "🌐 {s}", .{url[0..url_len]}) catch url[0..url_len];
+
+        var label_z: [65]u8 = undefined;
+        @memcpy(label_z[0..display.len], display);
+        label_z[display.len] = 0;
+
+        const btn = c.gtk_button_new_with_label(&label_z) orelse return;
+        c.gtk_widget_set_halign(btn, c.GTK_ALIGN_END);
+        c.gtk_widget_set_valign(btn, c.GTK_ALIGN_END);
+        c.gtk_widget_set_margin_end(btn, 8);
+        c.gtk_widget_set_margin_bottom(btn, 8);
+        c.gtk_widget_set_opacity(btn, 0.9);
+        c.gtk_widget_add_css_class(btn, "suggested-action");
+
+        // Store target_id on the button for the click handler
+        c.g_object_set_data(@ptrCast(@alignCast(btn)), "cmux-target-id", @constCast(@ptrCast(tab.browser_target_id[0..tid_len :0].ptr)));
+
+        _ = c.g_signal_connect_data(
+            @ptrCast(btn),
+            "clicked",
+            @ptrCast(&onBrowserTabClick),
+            null,
+            null,
+            0,
+        );
+
+        c.gtk_overlay_add_overlay(tab.overlay, btn);
+        tab.browser_button = btn;
+    }
+
+    fn onBrowserTabClick(button: *c.GtkButton, _: ?*anyopaque) callconv(.C) void {
+        const raw = c.g_object_get_data(@ptrCast(@alignCast(button)), "cmux-target-id") orelse return;
+        const target_id: [*:0]const u8 = @ptrCast(raw);
+        const tid = std.mem.span(target_id);
+
+        log.info("CDP: activating tab {s}", .{tid});
+
+        // GET http://localhost:9222/json/activate/{target_id}
+        var activate_url: [256]u8 = undefined;
+        const url = std.fmt.bufPrint(&activate_url, "http://localhost:9222/json/activate/{s}", .{tid}) catch return;
+        var url_z: [257]u8 = undefined;
+        @memcpy(url_z[0..url.len], url);
+        url_z[url.len] = 0;
+
+        const pid = std.posix.fork() catch return;
+        if (pid == 0) {
+            const argv = [_:null]?[*:0]const u8{
+                "curl", "-s", url_z[0..url.len :0],
+                null,
+            };
+            _ = std.posix.execvpeZ("curl", &argv, @ptrCast(std.c.environ)) catch {};
+            std.posix.exit(1);
+        }
+        // Don't wait — fire and forget
     }
 
     // --- Signal handlers ---
