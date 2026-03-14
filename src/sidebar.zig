@@ -157,6 +157,19 @@ pub const Sidebar = struct {
                 c.gtk_box_append(row_box, cwd_label);
             }
 
+            // === Row 4: Minimap (live widget paintable) ===
+            const paintable = c.gtk_widget_paintable_new(ws.containerWidget());
+            if (paintable) |p| {
+                const picture: *c.GtkPicture = @ptrCast(@alignCast(
+                    c.gtk_picture_new_for_paintable(@ptrCast(@alignCast(p))) orelse continue,
+                ));
+                c.gtk_picture_set_content_fit(picture, c.GTK_CONTENT_FIT_CONTAIN);
+                c.gtk_widget_set_size_request(asWidget(picture), -1, 48);
+                c.gtk_widget_set_opacity(asWidget(picture), 0.8);
+                c.gtk_box_append(row_box, asWidget(picture));
+                c.g_object_unref(p);
+            }
+
             // Row padding
             const row_w = asWidget(row_box);
             c.gtk_widget_set_margin_start(row_w, 8);
