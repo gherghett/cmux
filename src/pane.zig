@@ -453,49 +453,76 @@ pub const Pane = struct {
         }
     }
 
-    fn openUrlAndTrack(url: []const u8, terminal: *c.VteTerminal, pane: ?*Pane) void {
+    fn openUrlAndTrack(url: []const u8, _: *c.VteTerminal, pane: ?*Pane) void {
+        // Use CDP to open the URL: PUT /json/new?{url}
+        // This creates a new tab AND returns the tab ID immediately.
+        var cdp_url_buf: [2200]u8 = undefined;
+        const cdp_url = std.fmt.bufPrint(&cdp_url_buf,
+            "http://localhost:9222/json/new?{s}", .{url},
+        ) catch return;
+        var cdp_url_z: [2201]u8 = undefined;
+        @memcpy(cdp_url_z[0..cdp_url.len], cdp_url);
+        cdp_url_z[cdp_url.len] = 0;
+
+        const pid = std.posix.fork() catch return;
+        if (pid == 0) {
+            const argv = [_:null]?[*:0]const u8{
+                "curl", "-s", "-X", "PUT",
+                cdp_url_z[0..cdp_url.len :0],
+                "-o", "/tmp/cmux-cdp-new.json",
+                null,
+            };
+            _ = std.posix.execvpeZ("curl", &argv, @ptrCast(std.c.environ)) catch {};
+            std.posix.exit(1);
+        }
+        _ = std.posix.waitpid(pid, 0);
+
+        // Read response — contains {"id": "TARGET_ID", "url": "...", ...}
+        const file = std.fs.openFileAbsolute("/tmp/cmux-cdp-new.json", .{}) catch {
+            fallbackOpen(url);
+            return;
+        };
+        defer file.close();
+        var buf: [4096]u8 = undefined;
+        const n = file.read(&buf) catch { fallbackOpen(url); return; };
+        if (n == 0) { fallbackOpen(url); return; }
+        const json = buf[0..n];
+
+        // Extract "id" from response
+        const id_needle = "\"id\":";
+        if (std.mem.indexOf(u8, json, id_needle)) |id_key| {
+            const after = json[id_key + id_needle.len ..];
+            const q1 = std.mem.indexOfScalar(u8, after, '"') orelse { fallbackOpen(url); return; };
+            const content = after[q1 + 1 ..];
+            const q2 = std.mem.indexOfScalar(u8, content, '"') orelse { fallbackOpen(url); return; };
+            const target_id = content[0..q2];
+
+            log.info("CDP: opened tab {s} for {s}", .{ target_id, url });
+            if (pane) |p| storeBrowserTab(p, target_id, url);
+        } else {
+            log.info("CDP: no id in response, falling back", .{});
+            fallbackOpen(url);
+        }
+    }
+
+    fn fallbackOpen(url: []const u8) void {
         var url_z: [2048]u8 = undefined;
         const ulen = @min(url.len, 2047);
         @memcpy(url_z[0..ulen], url[0..ulen]);
         url_z[ulen] = 0;
-
-        // Snapshot current tab IDs BEFORE opening (to diff later)
-        var before_ids: [64][64]u8 = undefined;
-        var before_urls: [64][256]u8 = undefined;
-        var before_count: usize = 0;
-        snapshotCdpTabs(&before_ids, &before_urls, &before_count);
-
-        // Open URL via GLib launcher
         const display = c.gdk_display_get_default();
-        const launch_ctx: ?*c.GAppLaunchContext = if (display) |d|
+        const ctx: ?*c.GAppLaunchContext = if (display) |d|
             @ptrCast(@alignCast(c.gdk_display_get_app_launch_context(d)))
-        else
-            null;
-
+        else null;
         var err: ?*c.GError = null;
-        _ = c.g_app_info_launch_default_for_uri(&url_z, launch_ctx, &err);
-        if (launch_ctx) |lctx| c.g_object_unref(@ptrCast(@alignCast(lctx)));
-        if (err) |e| {
-            log.err("failed to open URL: {s}", .{@as([*:0]const u8, @ptrCast(e.message))});
-            c.g_error_free(e);
-            return;
-        }
-
-        // Poll CDP to find the NEW tab (by diffing with snapshot)
-        const ctx = std.heap.c_allocator.create(CdpPollCtx) catch return;
-        ctx.url_len = ulen;
-        @memcpy(ctx.url[0..ulen], url[0..ulen]);
-        ctx.url[ulen] = 0;
-        ctx.attempts = 0;
-        ctx.terminal = terminal;
-        ctx.pane = pane;
-        ctx.before_ids = before_ids;
-        ctx.before_count = before_count;
-
-        _ = c.g_timeout_add(500, @ptrCast(&onCdpPoll), ctx);
+        _ = c.g_app_info_launch_default_for_uri(&url_z, ctx, &err);
+        if (ctx) |lc| c.g_object_unref(@ptrCast(@alignCast(lc)));
+        if (err) |e| c.g_error_free(e);
     }
 
-    fn snapshotCdpTabIds(ids: *[64][64]u8, count: *usize) void {
+    fn _dead_code_start_marker() void { // REMOVE THIS BLOCK
+    }
+    fn _unused_snapshotCdpTabIds(ids: *[64][64]u8, count: *usize) void {
         count.* = 0;
         const pid = std.posix.fork() catch return;
         if (pid == 0) {
