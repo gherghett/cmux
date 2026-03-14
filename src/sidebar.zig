@@ -157,17 +157,34 @@ pub const Sidebar = struct {
                 c.gtk_box_append(row_box, cwd_label);
             }
 
-            // === Row 4: Minimap (live widget paintable) ===
-            const paintable = c.gtk_widget_paintable_new(ws.containerWidget());
-            if (paintable) |p| {
+            // === Row 4: Minimap ===
+            // Only create/update paintable for the ACTIVE workspace.
+            // For inactive ones, show the cached snapshot (stored on workspace).
+            if (i == self.tab_manager.selected) {
+                // Active: take a fresh snapshot and cache it
+                const paintable = c.gtk_widget_paintable_new(ws.containerWidget());
+                if (paintable) |p| {
+                    // Store the paintable on the workspace for later reuse
+                    if (ws.minimap_paintable) |old| c.g_object_unref(@ptrCast(@alignCast(old)));
+                    ws.minimap_paintable = @ptrCast(@alignCast(p));
+
+                    const picture: *c.GtkPicture = @ptrCast(@alignCast(
+                        c.gtk_picture_new_for_paintable(@ptrCast(@alignCast(p))) orelse continue,
+                    ));
+                    c.gtk_picture_set_content_fit(picture, c.GTK_CONTENT_FIT_CONTAIN);
+                    c.gtk_widget_set_size_request(asWidget(picture), -1, 48);
+                    c.gtk_widget_set_opacity(asWidget(picture), 0.8);
+                    c.gtk_box_append(row_box, asWidget(picture));
+                }
+            } else if (ws.minimap_paintable) |p| {
+                // Inactive: show cached paintable (frozen at last active state)
                 const picture: *c.GtkPicture = @ptrCast(@alignCast(
                     c.gtk_picture_new_for_paintable(@ptrCast(@alignCast(p))) orelse continue,
                 ));
                 c.gtk_picture_set_content_fit(picture, c.GTK_CONTENT_FIT_CONTAIN);
                 c.gtk_widget_set_size_request(asWidget(picture), -1, 48);
-                c.gtk_widget_set_opacity(asWidget(picture), 0.8);
+                c.gtk_widget_set_opacity(asWidget(picture), 0.6);
                 c.gtk_box_append(row_box, asWidget(picture));
-                c.g_object_unref(p);
             }
 
             // Row padding

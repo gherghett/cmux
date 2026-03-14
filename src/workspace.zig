@@ -20,6 +20,7 @@ pub const Workspace = struct {
     container: *c.GtkBox,
     allocator: std.mem.Allocator,
     socket_path: []const u8,
+    minimap_paintable: ?*anyopaque = null, // GdkPaintable* cached for inactive tabs
 
     /// Claude Code status for sidebar indicator.
     ///
