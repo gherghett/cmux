@@ -376,47 +376,112 @@ pub const SocketServer = struct {
         return buf[0..out];
     }
 
-    fn cmdNotify(_: *SocketServer, args: []const u8) []const u8 {
+    fn cmdNotify(self: *SocketServer, args: []const u8) []const u8 {
         if (args.len == 0) return "ERROR: missing title";
 
-        // Parse: title|subtitle|body  or  title body
+        // Split off --tab= flag if present
+        var content = args;
+        var target_ws_id: ?uuid.Uuid = null;
+        if (std.mem.indexOf(u8, args, "--tab=")) |flag_pos| {
+            content = std.mem.trim(u8, args[0..flag_pos], " ");
+            const flag_rest = args[flag_pos + 6 ..];
+            if (flag_rest.len >= 36) {
+                var ws_id: uuid.Uuid = undefined;
+                @memcpy(&ws_id, flag_rest[0..36]);
+                target_ws_id = ws_id;
+            }
+        }
+
+        // Parse: title|body
         var title_z: [257]u8 = undefined;
         var body_z: [513]u8 = undefined;
         var title_len: usize = 0;
         var body_len: usize = 0;
 
-        // Check for pipe-separated format
-        if (std.mem.indexOfScalar(u8, args, '|')) |pipe_pos| {
+        if (std.mem.indexOfScalar(u8, content, '|')) |pipe_pos| {
             title_len = @min(pipe_pos, 256);
-            @memcpy(title_z[0..title_len], args[0..title_len]);
+            @memcpy(title_z[0..title_len], content[0..title_len]);
             title_z[title_len] = 0;
 
-            const rest = args[pipe_pos + 1 ..];
-            // Skip subtitle (second field), use body (third field)
-            if (std.mem.indexOfScalar(u8, rest, '|')) |pipe2| {
-                const body = rest[pipe2 + 1 ..];
-                body_len = @min(body.len, 512);
-                @memcpy(body_z[0..body_len], body[0..body_len]);
-            } else {
-                body_len = @min(rest.len, 512);
-                @memcpy(body_z[0..body_len], rest[0..body_len]);
-            }
+            const rest = content[pipe_pos + 1 ..];
+            body_len = @min(rest.len, 512);
+            @memcpy(body_z[0..body_len], rest[0..body_len]);
             body_z[body_len] = 0;
         } else {
-            title_len = @min(args.len, 256);
-            @memcpy(title_z[0..title_len], args[0..title_len]);
+            title_len = @min(content.len, 256);
+            @memcpy(title_z[0..title_len], content[0..title_len]);
             title_z[title_len] = 0;
             body_z[0] = 0;
         }
 
-        // Send desktop notification
         const n = c.notify_notification_new(&title_z, if (body_len > 0) &body_z else null, null);
         if (n) |notification| {
+            // Add click action to switch to the workspace
+            if (target_ws_id != null) {
+                // Store the notification context for the click callback
+                const ctx = self.allocator.create(NotifyClickCtx) catch {
+                    _ = c.notify_notification_show(notification, null);
+                    c.g_object_unref(notification);
+                    return "OK";
+                };
+                ctx.* = .{
+                    .tab_manager = self.tab_manager,
+                    .ws_id = target_ws_id.?,
+                    .notification = notification,
+                };
+
+                c.notify_notification_add_action(
+                    notification,
+                    "default",
+                    "Open",
+                    @ptrCast(&onNotifyClicked),
+                    ctx,
+                    @ptrCast(&onNotifyCtxFree),
+                );
+            }
+
             _ = c.notify_notification_show(notification, null);
-            c.g_object_unref(notification);
+
+            // Don't unref if we added an action — the callback needs it alive.
+            // The ctx free callback will handle cleanup.
+            if (target_ws_id == null) {
+                c.g_object_unref(notification);
+            }
         }
 
         return "OK";
+    }
+
+    const NotifyClickCtx = struct {
+        tab_manager: *TabManager,
+        ws_id: uuid.Uuid,
+        notification: *c.NotifyNotification,
+    };
+
+    fn onNotifyClicked(
+        _: *c.NotifyNotification,
+        _: [*:0]const u8,
+        user_data: ?*anyopaque,
+    ) callconv(.C) void {
+        const ctx: *NotifyClickCtx = @ptrCast(@alignCast(user_data orelse return));
+
+        // Switch to the workspace
+        _ = ctx.tab_manager.selectWorkspace(&ctx.ws_id);
+
+        // Raise the window
+        const gtk_app = c.g_application_get_default();
+        if (gtk_app) |app| {
+            const win = c.gtk_application_get_active_window(@ptrCast(@alignCast(app)));
+            if (win) |w| {
+                c.gtk_window_present(w);
+            }
+        }
+    }
+
+    fn onNotifyCtxFree(user_data: ?*anyopaque) callconv(.C) void {
+        const ctx: *NotifyClickCtx = @ptrCast(@alignCast(user_data orelse return));
+        c.g_object_unref(ctx.notification);
+        ctx.tab_manager.allocator.destroy(ctx);
     }
 
     fn cmdSetStatus(self: *SocketServer, args: []const u8) []const u8 {

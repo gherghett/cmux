@@ -141,10 +141,10 @@ fn handleClaudeHook(args: [][*:0]u8) void {
         const cmd = std.fmt.bufPrint(&cmd_buf, "set_status claude_code Unread --tab={s}", .{ws_id}) catch return;
         _ = sendCommand(cmd) catch {};
 
-        // Desktop notification with the actual message
+        // Desktop notification linked to this workspace
         const notif_text = last_msg orelse "Claude finished";
         var notify_buf: [512]u8 = undefined;
-        const notify = std.fmt.bufPrint(&notify_buf, "notify Claude Code|{s}", .{notif_text[0..@min(notif_text.len, 200)]}) catch return;
+        const notify = std.fmt.bufPrint(&notify_buf, "notify Claude Code|{s} --tab={s}", .{ notif_text[0..@min(notif_text.len, 200)], ws_id }) catch return;
         _ = sendCommand(notify) catch {};
     } else if (std.mem.eql(u8, subcommand, "notification") or std.mem.eql(u8, subcommand, "notify")) {
         // Notification — Claude needs attention.
@@ -171,9 +171,10 @@ fn handleClaudeHook(args: [][*:0]u8) void {
         }
 
         // Desktop notification
+        // Desktop notification linked to workspace
         const notif_text = hook_message orelse "Claude needs attention";
         var notify_buf: [512]u8 = undefined;
-        const notify = std.fmt.bufPrint(&notify_buf, "notify Claude Code|{s}", .{notif_text[0..@min(notif_text.len, 200)]}) catch return;
+        const notify = std.fmt.bufPrint(&notify_buf, "notify Claude Code|{s} --tab={s}", .{ notif_text[0..@min(notif_text.len, 200)], ws_id }) catch return;
         _ = sendCommand(notify) catch {};
     } else {
         std.debug.print("unknown claude-hook subcommand: {s}\n", .{subcommand});
