@@ -15,9 +15,9 @@ var g_notifications: ?NotificationManager = null;
 const default_socket_path = "/tmp/cmux.sock";
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // Use c_allocator — no leak detection noise on shutdown.
+    // We intentionally skip window/pane cleanup (GTK handles it).
+    const allocator = std.heap.c_allocator;
 
     const socket_path = std.posix.getenv("CMUX_SOCKET_PATH") orelse default_socket_path;
 
