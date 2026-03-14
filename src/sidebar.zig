@@ -253,6 +253,10 @@ pub const Sidebar = struct {
         ws_index: usize,
     };
 
+    fn onPopoverClosed(popover: *c.GtkPopover, _: ?*anyopaque) callconv(.C) void {
+        c.gtk_widget_unparent(asWidget(popover));
+    }
+
     fn onMenuCtxFree(data: ?*anyopaque, _: ?*anyopaque) callconv(.C) void {
         const ctx: *MenuCtx = @ptrCast(@alignCast(data orelse return));
         ctx.sidebar.tab_manager.allocator.destroy(ctx);
@@ -280,6 +284,16 @@ pub const Sidebar = struct {
             c.gtk_popover_new() orelse return,
         ));
         c.gtk_widget_set_parent(asWidget(popover), asWidget(row));
+
+        // Clean up popover when it closes (unparent to avoid GtkListBoxRow finalize warning)
+        _ = c.g_signal_connect_data(
+            @ptrCast(popover),
+            "closed",
+            @ptrCast(&onPopoverClosed),
+            null,
+            null,
+            0,
+        );
 
         // Content: vertical box with menu items
         const menu_box: *c.GtkBox = @ptrCast(@alignCast(
