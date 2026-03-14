@@ -137,6 +137,9 @@ pub const Pane = struct {
         );
         c.gtk_widget_add_controller(asWidget(terminal), focus_controller);
 
+        // URL matching: make URLs clickable
+        setupUrlMatching(terminal);
+
         // Spawn shell
         self.spawnShell(terminal, cwd);
 
@@ -362,6 +365,153 @@ pub const Pane = struct {
         if (self.currentTerminal()) |term| {
             _ = c.gtk_widget_grab_focus(asWidget(term));
         }
+    }
+
+    // --- URL matching ---
+
+    fn setupUrlMatching(terminal: *c.VteTerminal) void {
+        // URL regex pattern: matches http(s), localhost, and common URLs
+        const url_pattern = "https?://[\\w\\-.]+(:\\d+)?(/[\\w\\-.~:/?#\\[\\]@!$&'()*+,;=%]*)?";
+        var err: ?*c.GError = null;
+        const PCRE2_MULTILINE = 0x00000400; // from pcre2.h
+        const regex = c.vte_regex_new_for_match(url_pattern, -1, PCRE2_MULTILINE, &err);
+        if (regex == null) return;
+
+        const tag = c.vte_terminal_match_add_regex(terminal, regex, 0);
+        c.vte_terminal_match_set_cursor_name(terminal, tag, "pointer");
+
+        // Allow OSC 8 hyperlinks too
+        c.vte_terminal_set_allow_hyperlink(terminal, 1);
+
+        // Handle clicks via a GtkGestureClick on the terminal
+        const click = c.gtk_gesture_click_new() orelse return;
+        c.gtk_gesture_single_set_button(@ptrCast(@alignCast(click)), 1); // left click
+
+        _ = c.g_signal_connect_data(
+            @ptrCast(click),
+            "pressed",
+            @ptrCast(&onTerminalClick),
+            terminal,
+            null,
+            0,
+        );
+        c.gtk_widget_add_controller(asWidget(terminal), @ptrCast(@alignCast(click)));
+    }
+
+    fn onTerminalClick(
+        _: *c.GtkGestureClick,
+        _: c.gint,
+        x: c.gdouble,
+        y: c.gdouble,
+        terminal: *c.VteTerminal,
+    ) callconv(.C) void {
+        // Check if click is on a URL (Ctrl+Click)
+        // First check for OSC 8 hyperlinks
+        var url: ?[*:0]u8 = null;
+
+        url = c.vte_terminal_check_hyperlink_at(terminal, x, y);
+        if (url == null) {
+            // Check regex-matched URLs
+            var tag: c_int = 0;
+            url = c.vte_terminal_check_match_at(terminal, x, y, &tag);
+        }
+
+        if (url) |u| {
+            const url_str = std.mem.span(u);
+            log.info("URL clicked: {s}", .{url_str});
+            openUrlAndTrack(url_str);
+            c.g_free(u);
+        }
+    }
+
+    fn openUrlAndTrack(url: []const u8) void {
+        // Open URL in browser via xdg-open
+        var url_z: [2048]u8 = undefined;
+        const ulen = @min(url.len, 2047);
+        @memcpy(url_z[0..ulen], url[0..ulen]);
+        url_z[ulen] = 0;
+
+        const pid = std.posix.fork() catch return;
+        if (pid == 0) {
+            // Child: exec xdg-open
+            const argv = [_:null]?[*:0]const u8{
+                "xdg-open",
+                url_z[0..ulen :0],
+                null,
+            };
+            _ = std.posix.execvpeZ("xdg-open", &argv, @ptrCast(std.c.environ)) catch {};
+            std.posix.exit(1);
+        }
+
+        // After opening, poll CDP to find the new tab
+        // Use a GLib timeout to check after a delay (give browser time to open the tab)
+        const ctx = std.heap.c_allocator.create(CdpPollCtx) catch return;
+        ctx.url_len = ulen;
+        @memcpy(ctx.url[0..ulen], url[0..ulen]);
+        ctx.url[ulen] = 0;
+        ctx.attempts = 0;
+
+        // Poll every 500ms for up to 5 seconds
+        _ = c.g_timeout_add(500, @ptrCast(&onCdpPoll), ctx);
+    }
+
+    const CdpPollCtx = struct {
+        url: [2048]u8,
+        url_len: usize,
+        attempts: u8,
+    };
+
+    fn onCdpPoll(user_data: ?*anyopaque) callconv(.C) c.gboolean {
+        const ctx: *CdpPollCtx = @ptrCast(@alignCast(user_data orelse return 0));
+        ctx.attempts += 1;
+
+        // Try to find the tab via CDP
+        const target_id = findCdpTab(ctx.url[0..ctx.url_len]);
+        if (target_id != null) {
+            log.info("CDP: found tab for URL, tracking", .{});
+            // TODO: store the tab on the workspace for sidebar display
+            std.heap.c_allocator.destroy(ctx);
+            return 0; // stop polling
+        }
+
+        if (ctx.attempts >= 10) {
+            // Give up after 5 seconds
+            std.heap.c_allocator.destroy(ctx);
+            return 0;
+        }
+
+        return 1; // keep polling
+    }
+
+    fn findCdpTab(url: []const u8) ?[]const u8 {
+        // Shell out to curl to query CDP
+        const pid = std.posix.fork() catch return null;
+        if (pid == 0) {
+            // Child: curl -s http://localhost:9222/json > /tmp/cmux-cdp-tabs.json
+            const argv = [_:null]?[*:0]const u8{
+                "curl", "-s", "-o", "/tmp/cmux-cdp-tabs.json",
+                "http://localhost:9222/json",
+                null,
+            };
+            _ = std.posix.execvpeZ("curl", &argv, @ptrCast(std.c.environ)) catch {};
+            std.posix.exit(1);
+        }
+
+        // Wait for curl
+        _ = std.posix.waitpid(pid, 0);
+
+        // Read the result and search for our URL
+        const file = std.fs.openFileAbsolute("/tmp/cmux-cdp-tabs.json", .{}) catch return null;
+        defer file.close();
+        var buf: [8192]u8 = undefined;
+        const n = file.read(&buf) catch return null;
+        const json = buf[0..n];
+
+        // Simple search: find "url":"<our_url>" nearby a "id":"<target_id>"
+        if (std.mem.indexOf(u8, json, url)) |_| {
+            return url; // Found it — for now just confirm it exists
+        }
+        return null;
     }
 
     // --- Signal handlers ---
