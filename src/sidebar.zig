@@ -144,6 +144,21 @@ pub const Sidebar = struct {
             c.gtk_widget_set_margin_top(row_w, 6);
             c.gtk_widget_set_margin_bottom(row_w, 6);
 
+            // Right-click menu
+            const click = c.gtk_gesture_click_new() orelse continue;
+            c.gtk_gesture_single_set_button(@ptrCast(@alignCast(click)), 3); // right click
+            const menu_ctx = self.tab_manager.allocator.create(MenuCtx) catch continue;
+            menu_ctx.* = .{ .sidebar = self, .ws_index = i };
+            _ = c.g_signal_connect_data(
+                @ptrCast(click),
+                "pressed",
+                @ptrCast(&onRightClick),
+                menu_ctx,
+                @ptrCast(&onMenuCtxFree),
+                0,
+            );
+            c.gtk_widget_add_controller(row_w, @ptrCast(@alignCast(click)));
+
             c.gtk_list_box_append(self.list_box, row_w);
 
             // Select current workspace
@@ -231,6 +246,157 @@ pub const Sidebar = struct {
         }
 
         return buf[0..pos];
+    }
+
+    const MenuCtx = struct {
+        sidebar: *Sidebar,
+        ws_index: usize,
+    };
+
+    fn onMenuCtxFree(data: ?*anyopaque, _: ?*anyopaque) callconv(.C) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(data orelse return));
+        ctx.sidebar.tab_manager.allocator.destroy(ctx);
+    }
+
+    fn onRightClick(
+        _: *c.GtkGestureClick,
+        _: c.gint,
+        _: c.gdouble,
+        _: c.gdouble,
+        user_data: ?*anyopaque,
+    ) callconv(.C) void {
+        const ctx: *MenuCtx = @ptrCast(@alignCast(user_data orelse return));
+        const sidebar = ctx.sidebar;
+        const ws_index = ctx.ws_index;
+        if (ws_index >= sidebar.tab_manager.workspaces.items.len) return;
+
+        const ws = sidebar.tab_manager.workspaces.items[ws_index];
+
+        // Get the row widget to anchor the popover
+        const row = c.gtk_list_box_get_row_at_index(sidebar.list_box, @intCast(ws_index)) orelse return;
+
+        // Create popover menu
+        const popover: *c.GtkPopover = @ptrCast(@alignCast(
+            c.gtk_popover_new() orelse return,
+        ));
+        c.gtk_widget_set_parent(asWidget(popover), asWidget(row));
+
+        // Content: vertical box with menu items
+        const menu_box: *c.GtkBox = @ptrCast(@alignCast(
+            c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0) orelse return,
+        ));
+
+        // "Rename" button
+        const rename_btn = c.gtk_button_new_with_label("Rename") orelse return;
+        c.gtk_button_set_has_frame(@ptrCast(@alignCast(rename_btn)), 0);
+        c.gtk_box_append(menu_box, rename_btn);
+
+        // Store context on the button for the callback
+        c.g_object_set_data(@ptrCast(@alignCast(rename_btn)), "cmux-popover", popover);
+        c.g_object_set_data(@ptrCast(@alignCast(rename_btn)), "cmux-sidebar", sidebar);
+
+        // Store workspace ID on the button
+        c.g_object_set_data(@ptrCast(@alignCast(rename_btn)), "cmux-ws", ws);
+
+        _ = c.g_signal_connect_data(
+            @ptrCast(rename_btn),
+            "clicked",
+            @ptrCast(&onRenameClicked),
+            null,
+            null,
+            0,
+        );
+
+        c.gtk_popover_set_child(popover, asWidget(menu_box));
+        c.gtk_popover_popup(popover);
+    }
+
+    fn onRenameClicked(button: *c.GtkButton, _: ?*anyopaque) callconv(.C) void {
+        const btn_widget = asWidget(button);
+        const popover_raw = c.g_object_get_data(@ptrCast(@alignCast(btn_widget)), "cmux-popover") orelse return;
+        const popover: *c.GtkPopover = @ptrCast(@alignCast(popover_raw));
+        const sidebar_raw = c.g_object_get_data(@ptrCast(@alignCast(btn_widget)), "cmux-sidebar") orelse return;
+        const sidebar: *Sidebar = @ptrCast(@alignCast(sidebar_raw));
+        const ws_raw = c.g_object_get_data(@ptrCast(@alignCast(btn_widget)), "cmux-ws") orelse return;
+        const ws: *Workspace = @ptrCast(@alignCast(ws_raw));
+
+        // Close the popover
+        c.gtk_popover_popdown(popover);
+
+        // Show a rename dialog
+        const app = c.g_application_get_default() orelse return;
+        const win = c.gtk_application_get_active_window(@ptrCast(@alignCast(app))) orelse return;
+
+        const dialog: *c.GtkWindow = @ptrCast(@alignCast(
+            c.gtk_window_new() orelse return,
+        ));
+        c.gtk_window_set_title(dialog, "Rename Workspace");
+        c.gtk_window_set_modal(dialog, 1);
+        c.gtk_window_set_transient_for(dialog, win);
+        c.gtk_window_set_default_size(dialog, 300, -1);
+
+        const vbox: *c.GtkBox = @ptrCast(@alignCast(
+            c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 8) orelse return,
+        ));
+        const vbox_w = asWidget(vbox);
+        c.gtk_widget_set_margin_start(vbox_w, 16);
+        c.gtk_widget_set_margin_end(vbox_w, 16);
+        c.gtk_widget_set_margin_top(vbox_w, 16);
+        c.gtk_widget_set_margin_bottom(vbox_w, 16);
+
+        // Entry with current title
+        var current_title_z: [257]u8 = undefined;
+        const current_title = ws.displayTitle();
+        const ctlen = @min(current_title.len, 256);
+        @memcpy(current_title_z[0..ctlen], current_title[0..ctlen]);
+        current_title_z[ctlen] = 0;
+
+        const entry: *c.GtkEntry = @ptrCast(@alignCast(c.gtk_entry_new() orelse return));
+        const entry_buf = c.gtk_entry_get_buffer(entry);
+        c.gtk_entry_buffer_set_text(entry_buf, &current_title_z, @intCast(ctlen));
+        c.gtk_box_append(vbox, asWidget(entry));
+
+        // Store workspace + sidebar on the entry for the activate callback
+        c.g_object_set_data(@ptrCast(@alignCast(entry)), "cmux-ws", ws);
+        c.g_object_set_data(@ptrCast(@alignCast(entry)), "cmux-sidebar", sidebar);
+        c.g_object_set_data(@ptrCast(@alignCast(entry)), "cmux-dialog", dialog);
+
+        // Enter key confirms rename
+        _ = c.g_signal_connect_data(
+            @ptrCast(entry),
+            "activate",
+            @ptrCast(&onRenameConfirmed),
+            null,
+            null,
+            0,
+        );
+
+        c.gtk_window_set_child(@ptrCast(@alignCast(dialog)), vbox_w);
+        c.gtk_window_present(dialog);
+        _ = c.gtk_widget_grab_focus(asWidget(entry));
+    }
+
+    fn onRenameConfirmed(entry: *c.GtkEntry, _: ?*anyopaque) callconv(.C) void {
+        const entry_w = asWidget(entry);
+        const ws_raw = c.g_object_get_data(@ptrCast(@alignCast(entry_w)), "cmux-ws") orelse return;
+        const ws: *Workspace = @ptrCast(@alignCast(ws_raw));
+        const sidebar_raw = c.g_object_get_data(@ptrCast(@alignCast(entry_w)), "cmux-sidebar") orelse return;
+        const sidebar: *Sidebar = @ptrCast(@alignCast(sidebar_raw));
+        const dialog_raw = c.g_object_get_data(@ptrCast(@alignCast(entry_w)), "cmux-dialog") orelse return;
+        const dialog: *c.GtkWindow = @ptrCast(@alignCast(dialog_raw));
+
+        // Get the text
+        const buf = c.gtk_entry_get_buffer(entry);
+        const text = c.gtk_entry_buffer_get_text(buf);
+        if (text) |t| {
+            const new_title = std.mem.span(t);
+            if (new_title.len > 0) {
+                ws.setTitle(new_title);
+                sidebar.refresh();
+            }
+        }
+
+        c.gtk_window_close(dialog);
     }
 
     fn onRowActivated(
