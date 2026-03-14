@@ -1,49 +1,15 @@
-# Xcode
-.build/
-build/
-DerivedData/
-*.xcuserstate
-xcuserdata/
-
-# macOS
-.DS_Store
-
-# Local env
-.env
-.envrc
-
-# Swift Package Manager
-.swiftpm/
-
-# GhosttyKit binary (built from ghostty submodule via scripts/setup.sh)
-GhosttyKit.xcframework
-GhosttyKit.xcframework.bak-*/
-
-# Release artifacts
-GhosttyTabs-*.zip
-cmux-macos.dmg
-appcast.xml
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
-.hypothesis/
-.vercel
-
 # Zig
 .zig-cache/
 zig-out/
 
-# Node
-node_modules/
-.next/
+# Build artifacts
+*.o
+*.a
 
-# Test outputs
-tests/visual_output/
-tests/visual_report.html
+# Test
+test_*.sh
+*.log
 
-# Local scratch (screenshots, etc.)
+# Local
+.env
 tmp/
-tmp-*/
