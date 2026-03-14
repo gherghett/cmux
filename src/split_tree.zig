@@ -290,13 +290,20 @@ pub const SplitTree = struct {
         // No matching split found — focus stays where it is
     }
 
-    /// Collect all panes in the tree (for iteration).
+    /// Collect all LIVE panes by traversing from root (skips dead nodes).
     pub fn allPanes(self: *SplitTree, out: *std.ArrayList(*Pane)) !void {
-        for (self.nodes.items) |node| {
-            switch (node) {
-                .leaf => |leaf| try out.append(leaf.pane),
-                .split => {},
-            }
+        if (self.root == INVALID) return;
+        try self.collectPanes(self.root, out);
+    }
+
+    fn collectPanes(self: *SplitTree, idx: NodeIndex, out: *std.ArrayList(*Pane)) !void {
+        if (idx >= self.nodes.items.len) return;
+        switch (self.nodes.items[idx]) {
+            .leaf => |leaf| try out.append(leaf.pane),
+            .split => |s| {
+                try self.collectPanes(s.first, out);
+                try self.collectPanes(s.second, out);
+            },
         }
     }
 

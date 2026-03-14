@@ -159,6 +159,14 @@ pub const Window = struct {
                     _ = tab_manager.createWorkspace() catch return 0;
                     return 1;
                 },
+                c.GDK_KEY_Q, c.GDK_KEY_q => {
+                    // Close current workspace
+                    if (tab_manager.current()) |ws| {
+                        var ws_id = ws.id;
+                        tab_manager.closeWorkspace(&ws_id);
+                    }
+                    return 1;
+                },
                 c.GDK_KEY_N, c.GDK_KEY_n => {
                     // New tab in current pane, inheriting CWD
                     if (tab_manager.current()) |ws| {
