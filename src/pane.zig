@@ -27,6 +27,10 @@ pub const Pane = struct {
     on_focus: ?*const fn (pane: *Pane, ctx: ?*anyopaque) void = null,
     on_focus_ctx: ?*anyopaque = null,
 
+    /// Called when the terminal title changes (for workspace title auto-update).
+    on_title: ?*const fn (title: [*:0]const u8, ctx: ?*anyopaque) void = null,
+    on_title_ctx: ?*anyopaque = null,
+
     pub const Tab = struct {
         id: uuid.Uuid,
         terminal: *c.VteTerminal,
@@ -775,13 +779,20 @@ pub const Pane = struct {
     }
 
     fn onTitleChanged(terminal: *c.VteTerminal, pane: *Pane) callconv(.C) void {
-        const title = c.vte_terminal_get_window_title(terminal);
-        if (title == null) return;
+        const title = c.vte_terminal_get_window_title(terminal) orelse return;
 
+        // Update pane tab label
         for (pane.tabs.items) |tab| {
             if (tab.terminal == terminal) {
                 c.gtk_label_set_text(tab.label, title);
                 break;
+            }
+        }
+
+        // Propagate to workspace title (if this is the focused terminal)
+        if (pane.currentTerminal() == terminal) {
+            if (pane.on_title) |callback| {
+                callback(title, pane.on_title_ctx);
             }
         }
     }

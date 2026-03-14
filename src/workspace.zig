@@ -89,6 +89,8 @@ pub const Workspace = struct {
         pane.node_index = 0; // root node
         pane.on_focus = &onPaneFocus;
         pane.on_focus_ctx = ws;
+        pane.on_title = &onPaneTitle;
+        pane.on_title_ctx = ws;
         const pane_w = pane.widget();
         c.gtk_widget_set_vexpand(pane_w, 1);
         c.gtk_widget_set_hexpand(pane_w, 1);
@@ -168,6 +170,8 @@ pub const Workspace = struct {
         new_pane.on_empty_ctx = self;
         new_pane.on_focus = &onPaneFocus;
         new_pane.on_focus_ctx = self;
+        new_pane.on_title = &onPaneTitle;
+        new_pane.on_title_ctx = self;
 
         const new_idx = try self.split_tree.split(self.split_tree.focused, direction, new_pane);
         new_pane.node_index = new_idx;
@@ -225,6 +229,17 @@ pub const Workspace = struct {
         }
     }
 
+    fn onPaneTitle(title: [*:0]const u8, ctx: ?*anyopaque) void {
+        const self: *Workspace = @ptrCast(@alignCast(ctx orelse return));
+        // Only auto-update if no custom title is set
+        if (self.custom_title != null) return;
+
+        const t = std.mem.span(title);
+        const len = @min(t.len, 256);
+        @memcpy(self.title[0..len], t[0..len]);
+        self.title_len = len;
+    }
+
     fn onPaneFocus(pane: *Pane, ctx: ?*anyopaque) void {
         const self: *Workspace = @ptrCast(@alignCast(ctx orelse return));
         if (pane.node_index != SplitTree.INVALID) {
@@ -264,6 +279,8 @@ pub const Workspace = struct {
         pane.on_empty_ctx = self;
         pane.on_focus = &onPaneFocus;
         pane.on_focus_ctx = self;
+        pane.on_title = &onPaneTitle;
+        pane.on_title_ctx = self;
 
         try self.split_tree.setRoot(pane);
         pane.node_index = @intCast(self.split_tree.nodes.items.len - 1);
