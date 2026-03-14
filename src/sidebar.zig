@@ -21,6 +21,8 @@ pub const Sidebar = struct {
     list_box: *c.GtkListBox,
     scrolled: *c.GtkScrolledWindow,
     tab_manager: *TabManager,
+    last_ws_count: usize = 0,
+    last_selected: usize = 0,
 
     pub fn init(tab_manager: *TabManager) !Sidebar {
         const list_box: *c.GtkListBox = @ptrCast(@alignCast(c.gtk_list_box_new() orelse
@@ -65,9 +67,20 @@ pub const Sidebar = struct {
 
     fn onPeriodicRefresh(user_data: ?*anyopaque) callconv(.C) c.gboolean {
         const self: *Sidebar = @ptrCast(@alignCast(user_data orelse return 0));
-        self.refresh();
 
-        // Also poll CDP for closed browser tabs
+        // Update minimap snapshot for active workspace (doesn't rebuild rows)
+        if (self.tab_manager.current()) |ws| {
+            updateMinimapSnapshot(ws);
+        }
+
+        // Only do full rebuild if workspace count or selection changed
+        const ws_count = self.tab_manager.workspaces.items.len;
+        const selected = self.tab_manager.selected;
+        if (ws_count != self.last_ws_count or selected != self.last_selected) {
+            self.refresh();
+        }
+
+        // Poll CDP for closed browser tabs
         var pane_list = std.ArrayList(*Pane).init(self.tab_manager.allocator);
         defer pane_list.deinit();
         for (self.tab_manager.workspaces.items) |ws| {
@@ -77,14 +90,35 @@ pub const Sidebar = struct {
             pane.pollBrowserTabs();
         }
 
-        return 1; // keep running
+        return 1;
+    }
+
+    fn updateMinimapSnapshot(ws: *Workspace) void {
+        const live = c.gtk_widget_paintable_new(ws.containerWidget());
+        if (live) |live_p| {
+            defer c.g_object_unref(live_p);
+            const paintable: *c.GdkPaintable = @ptrCast(@alignCast(live_p));
+            const w = c.gdk_paintable_get_intrinsic_width(paintable);
+            const h = c.gdk_paintable_get_intrinsic_height(paintable);
+            if (w > 0 and h > 0) {
+                const snap = c.gtk_snapshot_new();
+                c.gdk_paintable_snapshot(paintable, @ptrCast(@alignCast(snap)), @floatFromInt(w), @floatFromInt(h));
+                const size = c.graphene_size_t{ .width = @floatFromInt(w), .height = @floatFromInt(h) };
+                const static_p = c.gtk_snapshot_free_to_paintable(snap, &size);
+                if (static_p) |sp| {
+                    if (ws.minimap_paintable) |old| c.g_object_unref(@ptrCast(@alignCast(old)));
+                    ws.minimap_paintable = @ptrCast(sp);
+                }
+            }
+        }
     }
 
     pub fn widget(self: *Sidebar) *c.GtkWidget {
         return asWidget(self.scrolled);
     }
 
-    /// Rebuild the sidebar from workspace state.
+    /// Rebuild the sidebar from workspace state. Tracks version to avoid redundant rebuilds.
+
     pub fn refresh(self: *Sidebar) void {
         // Remove all existing rows
         while (c.gtk_list_box_get_row_at_index(self.list_box, 0)) |row| {
@@ -157,31 +191,7 @@ pub const Sidebar = struct {
                 c.gtk_box_append(row_box, cwd_label);
             }
 
-            // === Row 4: Minimap ===
-            // For active workspace: snapshot the live widget to a STATIC paintable.
-            // GtkWidgetPaintable is live and goes blank when widget is unrealized,
-            // so we must freeze it to a static copy.
-            if (i == self.tab_manager.selected) {
-                const live = c.gtk_widget_paintable_new(ws.containerWidget());
-                if (live) |live_p| {
-                    defer c.g_object_unref(live_p);
-                    const paintable: *c.GdkPaintable = @ptrCast(@alignCast(live_p));
-                    const w = c.gdk_paintable_get_intrinsic_width(paintable);
-                    const h = c.gdk_paintable_get_intrinsic_height(paintable);
-                    if (w > 0 and h > 0) {
-                        const snap = c.gtk_snapshot_new();
-                        c.gdk_paintable_snapshot(paintable, @ptrCast(@alignCast(snap)), @floatFromInt(w), @floatFromInt(h));
-                        const size = c.graphene_size_t{ .width = @floatFromInt(w), .height = @floatFromInt(h) };
-                        const static_p = c.gtk_snapshot_free_to_paintable(snap, &size);
-                        if (static_p) |sp| {
-                            if (ws.minimap_paintable) |old| c.g_object_unref(@ptrCast(@alignCast(old)));
-                            ws.minimap_paintable = @ptrCast(sp);
-                        }
-                    }
-                }
-            }
-
-            // Show cached static minimap (works for both active and inactive)
+            // === Row 4: Minimap (cached static snapshot) ===
             if (ws.minimap_paintable) |p| {
                 const picture: *c.GtkPicture = @ptrCast(@alignCast(
                     c.gtk_picture_new_for_paintable(@ptrCast(@alignCast(p))) orelse continue,
@@ -223,6 +233,10 @@ pub const Sidebar = struct {
                 }
             }
         }
+
+        // Track for change detection
+        self.last_ws_count = self.tab_manager.workspaces.items.len;
+        self.last_selected = self.tab_manager.selected;
     }
 
     const Indicator = struct {
