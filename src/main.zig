@@ -52,11 +52,12 @@ pub fn main() !void {
         @ptrCast(std.os.argv.ptr),
     );
 
-    // Cleanup
+    // Cleanup: socket and notifications only.
+    // Don't destroy window/tab_manager/panes — GTK already killed the
+    // VTE terminals during shutdown, triggering child-exited → pane.deinit().
+    // Calling deinit again would double-free.
     if (g_socket) |sock| sock.destroy();
     if (g_notifications) |*notifs| notifs.deinit();
-    g_notifications = null;
-    if (g_window) |win| win.destroy();
 
     if (status != 0) {
         log.err("application exited with status {}", .{status});
