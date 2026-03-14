@@ -175,31 +175,58 @@ pub const Sidebar = struct {
 
         const home = std.posix.getenv("HOME") orelse "";
 
-        var pos: usize = 0;
+        // Collect unique shortened CWDs
+        var cwds: [16][128]u8 = undefined;
+        var cwd_lens: [16]usize = undefined;
+        var cwd_count: usize = 0;
+
         for (pane_list.items) |pane| {
             const cwd_ptr = pane.getCwd() orelse continue;
             const cwd = std.mem.span(cwd_ptr);
             if (cwd.len == 0) continue;
 
+            // Shorten: replace $HOME with ~
+            var short_buf: [128]u8 = undefined;
+            var short_len: usize = 0;
+            if (home.len > 0 and std.mem.startsWith(u8, cwd, home)) {
+                short_buf[0] = '~';
+                const rest = cwd[home.len..];
+                const rlen = @min(rest.len, 127);
+                @memcpy(short_buf[1..][0..rlen], rest[0..rlen]);
+                short_len = 1 + rlen;
+            } else {
+                short_len = @min(cwd.len, 128);
+                @memcpy(short_buf[0..short_len], cwd[0..short_len]);
+            }
+
+            // Deduplicate
+            var is_dup = false;
+            for (0..cwd_count) |j| {
+                if (cwd_lens[j] == short_len and std.mem.eql(u8, cwds[j][0..short_len], short_buf[0..short_len])) {
+                    is_dup = true;
+                    break;
+                }
+            }
+            if (is_dup) continue;
+            if (cwd_count >= 16) break;
+
+            cwds[cwd_count] = short_buf;
+            cwd_lens[cwd_count] = short_len;
+            cwd_count += 1;
+        }
+
+        // Build output string
+        var pos: usize = 0;
+        for (0..cwd_count) |i| {
             if (pos > 0 and pos + 2 < buf.len) {
                 buf[pos] = ' ';
                 buf[pos + 1] = ' ';
                 pos += 2;
             }
-
-            // Shorten: replace $HOME with ~
-            const display = if (home.len > 0 and std.mem.startsWith(u8, cwd, home))
-                cwd[home.len..]
-            else
-                cwd;
-
-            const prefix = if (home.len > 0 and std.mem.startsWith(u8, cwd, home)) "~" else "";
-            const total = prefix.len + display.len;
-
-            if (pos + total >= buf.len) break;
-            @memcpy(buf[pos..][0..prefix.len], prefix);
-            @memcpy(buf[pos + prefix.len ..][0..display.len], display);
-            pos += total;
+            const slen = cwd_lens[i];
+            if (pos + slen >= buf.len) break;
+            @memcpy(buf[pos..][0..slen], cwds[i][0..slen]);
+            pos += slen;
         }
 
         return buf[0..pos];
