@@ -112,6 +112,40 @@ fn handleClaudeHook(args: [][*:0]u8) void {
     const hook_message = extractJsonField(stdin_data, "message");
     const notif_type = extractJsonField(stdin_data, "notification_type");
     const tool_name = extractJsonField(stdin_data, "tool_name");
+    const hook_cwd = extractJsonField(stdin_data, "cwd");
+
+    // Get workspace title for notification context
+    var ws_title: []const u8 = "Terminal";
+    var ws_title_buf: [256]u8 = undefined;
+    if (ws_id.len > 0) {
+        if (sendCommand("current_workspace")) |resp| {
+            // Response is "uuid\ttitle" — extract title after tab
+            if (std.mem.indexOfScalar(u8, resp, '\t')) |tab_pos| {
+                const t = std.mem.trim(u8, resp[tab_pos + 1 ..], " \n\r");
+                const tlen = @min(t.len, 256);
+                @memcpy(ws_title_buf[0..tlen], t[0..tlen]);
+                ws_title = ws_title_buf[0..tlen];
+            }
+        } else |_| {}
+    }
+
+    // Shorten CWD for display
+    const home = std.posix.getenv("HOME") orelse "";
+    var short_cwd: []const u8 = "";
+    var short_cwd_buf: [128]u8 = undefined;
+    if (hook_cwd) |cwd| {
+        if (home.len > 0 and std.mem.startsWith(u8, cwd, home)) {
+            const rest = cwd[home.len..];
+            short_cwd_buf[0] = '~';
+            const rlen = @min(rest.len, 127);
+            @memcpy(short_cwd_buf[1..][0..rlen], rest[0..rlen]);
+            short_cwd = short_cwd_buf[0 .. 1 + rlen];
+        } else {
+            const clen = @min(cwd.len, 128);
+            @memcpy(short_cwd_buf[0..clen], cwd[0..clen]);
+            short_cwd = short_cwd_buf[0..clen];
+        }
+    }
 
     if (std.mem.eql(u8, subcommand, "session-start") or std.mem.eql(u8, subcommand, "active")) {
         // PreToolUse — Claude is actively working. Set ✦ Running.
@@ -141,10 +175,13 @@ fn handleClaudeHook(args: [][*:0]u8) void {
         const cmd = std.fmt.bufPrint(&cmd_buf, "set_status claude_code Unread --tab={s}", .{ws_id}) catch return;
         _ = sendCommand(cmd) catch {};
 
-        // Desktop notification linked to this workspace
-        const notif_text = last_msg orelse "Claude finished";
-        var notify_buf: [512]u8 = undefined;
-        const notify = std.fmt.bufPrint(&notify_buf, "notify Claude Code|{s} --tab={s}", .{ notif_text[0..@min(notif_text.len, 200)], ws_id }) catch return;
+        // Desktop notification: "Claude · ws-title · ~/cwd | last message"
+        const notif_body = last_msg orelse "Claude finished";
+        var notify_buf: [768]u8 = undefined;
+        const notify = if (short_cwd.len > 0)
+            std.fmt.bufPrint(&notify_buf, "notify Claude · {s} · {s}|{s} --tab={s}", .{ ws_title, short_cwd, notif_body[0..@min(notif_body.len, 200)], ws_id }) catch return
+        else
+            std.fmt.bufPrint(&notify_buf, "notify Claude · {s}|{s} --tab={s}", .{ ws_title, notif_body[0..@min(notif_body.len, 200)], ws_id }) catch return;
         _ = sendCommand(notify) catch {};
     } else if (std.mem.eql(u8, subcommand, "notification") or std.mem.eql(u8, subcommand, "notify")) {
         // Notification — Claude needs attention.
@@ -171,10 +208,13 @@ fn handleClaudeHook(args: [][*:0]u8) void {
         }
 
         // Desktop notification
-        // Desktop notification linked to workspace
-        const notif_text = hook_message orelse "Claude needs attention";
-        var notify_buf: [512]u8 = undefined;
-        const notify = std.fmt.bufPrint(&notify_buf, "notify Claude Code|{s} --tab={s}", .{ notif_text[0..@min(notif_text.len, 200)], ws_id }) catch return;
+        // Desktop notification: "Claude · ws-title · ~/cwd | message"
+        const notif_body = hook_message orelse "Claude needs attention";
+        var notify_buf: [768]u8 = undefined;
+        const notify = if (short_cwd.len > 0)
+            std.fmt.bufPrint(&notify_buf, "notify Claude · {s} · {s}|{s} --tab={s}", .{ ws_title, short_cwd, notif_body[0..@min(notif_body.len, 200)], ws_id }) catch return
+        else
+            std.fmt.bufPrint(&notify_buf, "notify Claude · {s}|{s} --tab={s}", .{ ws_title, notif_body[0..@min(notif_body.len, 200)], ws_id }) catch return;
         _ = sendCommand(notify) catch {};
     } else {
         std.debug.print("unknown claude-hook subcommand: {s}\n", .{subcommand});
