@@ -158,32 +158,37 @@ pub const Sidebar = struct {
             }
 
             // === Row 4: Minimap ===
-            // Only create/update paintable for the ACTIVE workspace.
-            // For inactive ones, show the cached snapshot (stored on workspace).
+            // For active workspace: snapshot the live widget to a STATIC paintable.
+            // GtkWidgetPaintable is live and goes blank when widget is unrealized,
+            // so we must freeze it to a static copy.
             if (i == self.tab_manager.selected) {
-                // Active: take a fresh snapshot and cache it
-                const paintable = c.gtk_widget_paintable_new(ws.containerWidget());
-                if (paintable) |p| {
-                    // Store the paintable on the workspace for later reuse
-                    if (ws.minimap_paintable) |old| c.g_object_unref(@ptrCast(@alignCast(old)));
-                    ws.minimap_paintable = @ptrCast(@alignCast(p));
-
-                    const picture: *c.GtkPicture = @ptrCast(@alignCast(
-                        c.gtk_picture_new_for_paintable(@ptrCast(@alignCast(p))) orelse continue,
-                    ));
-                    c.gtk_picture_set_content_fit(picture, c.GTK_CONTENT_FIT_CONTAIN);
-                    c.gtk_widget_set_size_request(asWidget(picture), -1, 48);
-                    c.gtk_widget_set_opacity(asWidget(picture), 0.8);
-                    c.gtk_box_append(row_box, asWidget(picture));
+                const live = c.gtk_widget_paintable_new(ws.containerWidget());
+                if (live) |live_p| {
+                    defer c.g_object_unref(live_p);
+                    const paintable: *c.GdkPaintable = @ptrCast(@alignCast(live_p));
+                    const w = c.gdk_paintable_get_intrinsic_width(paintable);
+                    const h = c.gdk_paintable_get_intrinsic_height(paintable);
+                    if (w > 0 and h > 0) {
+                        const snap = c.gtk_snapshot_new();
+                        c.gdk_paintable_snapshot(paintable, @ptrCast(@alignCast(snap)), @floatFromInt(w), @floatFromInt(h));
+                        const size = c.graphene_size_t{ .width = @floatFromInt(w), .height = @floatFromInt(h) };
+                        const static_p = c.gtk_snapshot_free_to_paintable(snap, &size);
+                        if (static_p) |sp| {
+                            if (ws.minimap_paintable) |old| c.g_object_unref(@ptrCast(@alignCast(old)));
+                            ws.minimap_paintable = @ptrCast(sp);
+                        }
+                    }
                 }
-            } else if (ws.minimap_paintable) |p| {
-                // Inactive: show cached paintable (frozen at last active state)
+            }
+
+            // Show cached static minimap (works for both active and inactive)
+            if (ws.minimap_paintable) |p| {
                 const picture: *c.GtkPicture = @ptrCast(@alignCast(
                     c.gtk_picture_new_for_paintable(@ptrCast(@alignCast(p))) orelse continue,
                 ));
                 c.gtk_picture_set_content_fit(picture, c.GTK_CONTENT_FIT_CONTAIN);
                 c.gtk_widget_set_size_request(asWidget(picture), -1, 48);
-                c.gtk_widget_set_opacity(asWidget(picture), 0.6);
+                c.gtk_widget_set_opacity(asWidget(picture), if (i == self.tab_manager.selected) 0.8 else 0.6);
                 c.gtk_box_append(row_box, asWidget(picture));
             }
 
