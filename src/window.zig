@@ -96,7 +96,11 @@ pub const Window = struct {
     fn onCloseRequest(_: *c.GtkWindow, self_ptr: ?*anyopaque) callconv(.C) c.gboolean {
         const self: *Window = @ptrCast(@alignCast(self_ptr orelse return 0));
         session.save(&self.tab_manager);
-        return 0; // allow close to proceed
+        // Mark all workspaces as closing to suppress auto-respawn during GTK teardown
+        for (self.tab_manager.workspaces.items) |ws| {
+            ws.closing = true;
+        }
+        return 0;
     }
 
     pub fn destroy(self: *Window) void {

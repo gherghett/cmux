@@ -21,6 +21,7 @@ pub const Workspace = struct {
     allocator: std.mem.Allocator,
     socket_path: []const u8,
     minimap_dirty: bool = true,
+    closing: bool = false, // suppress auto-respawn during close/shutdown
     sidebar: ?SidebarWidgets = null,
 
     /// Claude Code status for sidebar indicator.
@@ -279,8 +280,8 @@ pub const Workspace = struct {
                         self.split_tree.close(@intCast(i));
                         self.updateContainer();
 
-                        // If tree is now empty, create a fresh pane
-                        if (self.split_tree.root == SplitTree.INVALID) {
+                        // If tree is now empty, create a fresh pane (unless shutting down)
+                        if (self.split_tree.root == SplitTree.INVALID and !self.closing) {
                             self.createInitialPane() catch {
                                 log.err("failed to create replacement pane", .{});
                             };

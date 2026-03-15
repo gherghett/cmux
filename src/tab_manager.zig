@@ -70,7 +70,9 @@ pub const TabManager = struct {
     pub fn closeWorkspace(self: *TabManager, id: *const uuid.Uuid) void {
         for (self.workspaces.items, 0..) |ws, i| {
             if (uuid.eql(&ws.id, id)) {
-                // Kill dtach + disconnect signals for all panes (user-initiated close)
+                // Mark as closing to suppress auto-respawn
+                ws.closing = true;
+                // Kill dtach + disconnect signals for all panes
                 var pane_list = std.ArrayList(*Pane).init(self.allocator);
                 defer pane_list.deinit();
                 ws.allPanes(&pane_list) catch {};
