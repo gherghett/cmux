@@ -4,10 +4,10 @@ const c = cc.c;
 const Window = @import("window.zig").Window;
 const SocketServer = @import("socket.zig").SocketServer;
 const NotificationManager = @import("notification.zig").NotificationManager;
+const session = @import("session.zig");
 
 const log = std.log.scoped(.main);
 
-/// Global state — accessible from callbacks
 var g_window: ?*Window = null;
 var g_socket: ?*SocketServer = null;
 var g_notifications: ?NotificationManager = null;
@@ -15,10 +15,7 @@ var g_notifications: ?NotificationManager = null;
 const default_socket_path = "/tmp/cmux.sock";
 
 pub fn main() !void {
-    // Use c_allocator — no leak detection noise on shutdown.
-    // We intentionally skip window/pane cleanup (GTK handles it).
     const allocator = std.heap.c_allocator;
-
     const socket_path = std.posix.getenv("CMUX_SOCKET_PATH") orelse default_socket_path;
 
     const app: *c.AdwApplication = c.adw_application_new(
@@ -32,18 +29,15 @@ pub fn main() !void {
 
     const state = try allocator.create(AppState);
     defer allocator.destroy(state);
-    state.* = .{
-        .allocator = allocator,
-        .socket_path = socket_path,
-    };
+    state.* = .{ .allocator = allocator, .socket_path = socket_path };
 
     _ = c.g_signal_connect_data(
-        @ptrCast(app),
-        "activate",
-        @ptrCast(&onActivate),
-        state,
-        null,
-        0,
+        @ptrCast(app), "activate", @ptrCast(&onActivate), state, null, 0,
+    );
+
+    // Save session on shutdown
+    _ = c.g_signal_connect_data(
+        @ptrCast(app), "shutdown", @ptrCast(&onShutdown), null, null, 0,
     );
 
     const status = c.g_application_run(
@@ -52,10 +46,6 @@ pub fn main() !void {
         @ptrCast(std.os.argv.ptr),
     );
 
-    // Cleanup: socket and notifications only.
-    // Don't destroy window/tab_manager/panes — GTK already killed the
-    // VTE terminals during shutdown, triggering child-exited → pane.deinit().
-    // Calling deinit again would double-free.
     if (g_socket) |sock| sock.destroy();
     if (g_notifications) |*notifs| notifs.deinit();
 
@@ -84,7 +74,17 @@ fn onActivate(_: *c.GApplication, user_data: ?*anyopaque) callconv(.C) void {
     };
     g_window = win;
 
-    // Start socket server — pointer to win.tab_manager is stable (heap-allocated)
+    // Try to restore previous session
+    const restored = session.restore(&win.tab_manager);
+    if (restored) {
+        // Remove the default empty workspace that Window.create made
+        // (only if we restored workspaces successfully)
+        if (win.tab_manager.workspaces.items.len > 1) {
+            const first_id = win.tab_manager.workspaces.items[0].id;
+            win.tab_manager.closeWorkspace(&first_id);
+        }
+    }
+
     if (SocketServer.create(
         state.allocator,
         state.socket_path,
@@ -97,4 +97,10 @@ fn onActivate(_: *c.GApplication, user_data: ?*anyopaque) callconv(.C) void {
 
     win.show();
     log.info("cmux started (socket: {s})", .{state.socket_path});
+}
+
+fn onShutdown(_: *c.GApplication, _: ?*anyopaque) callconv(.C) void {
+    if (g_window) |win| {
+        session.save(&win.tab_manager);
+    }
 }

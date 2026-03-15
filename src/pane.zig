@@ -15,6 +15,9 @@ pub const Pane = struct {
     allocator: std.mem.Allocator,
     workspace_id: uuid.Uuid,
     socket_path: []const u8,
+    /// dtach socket path for this pane's primary terminal
+    dtach_path: [128]u8 = undefined,
+    dtach_path_len: usize = 0,
 
     /// Index of this pane's node in the split tree (set after insertion).
     node_index: u16 = std.math.maxInt(u16),
@@ -193,8 +196,15 @@ pub const Pane = struct {
         return &home_buf;
     }
 
+    /// Spawn a shell via dtach for process persistence.
+    /// If dtach_socket is provided, reattach to existing session.
+    /// Otherwise create a new dtach session.
     fn spawnShell(self: *Pane, terminal: *c.VteTerminal, cwd: ?[*:0]const u8) void {
-        // Initialize shell path once (static lifetime)
+        self.spawnShellDtach(terminal, cwd, null);
+    }
+
+    fn spawnShellDtach(self: *Pane, terminal: *c.VteTerminal, cwd: ?[*:0]const u8, existing_dtach: ?[]const u8) void {
+        // Initialize shell path once
         if (!shell_path_initialized) {
             const shell_env = std.posix.getenv("SHELL") orelse "/bin/bash";
             const slen = @min(shell_env.len, 255);
@@ -203,15 +213,9 @@ pub const Pane = struct {
             shell_path_initialized = true;
         }
 
-        const shell_z: [*:0]const u8 = &shell_path_buf;
-        var argv = [_:null]?[*:0]const u8{ shell_z, null };
-
-        // Default to $HOME if no CWD specified (like other terminals)
         const effective_cwd = cwd orelse getDefaultCwd();
 
-        // Set CMUX_* env vars in the current process before spawn.
-        // VTE inherits the parent environment when envv=null.
-        // We set them here so all child shells get them.
+        // Set CMUX_* env vars
         const tab = self.currentTab();
         const surface_id = if (tab) |t| uuid.asSlice(&t.id) else "unknown";
         const workspace_id = uuid.asSlice(&self.workspace_id);
@@ -222,21 +226,66 @@ pub const Pane = struct {
         setEnvZ("CMUX_TAB_ID", workspace_id);
         setEnvZ("CMUX_SOCKET_PATH", self.socket_path);
         _ = c.g_setenv("TERM_PROGRAM", "cmux", 1);
-
-        // Prepend cmux's bin/ dir to PATH so `cmux-cli` is found,
-        // and set CMUX_SHELL_INTEGRATION_DIR so .bashrc can source the init script.
         prependBinToPath();
+
+        // Build dtach socket path
+        var dtach_sock: [128]u8 = undefined;
+        var dtach_sock_len: usize = 0;
+
+        if (existing_dtach) |path| {
+            // Reattach to existing dtach session
+            dtach_sock_len = @min(path.len, 127);
+            @memcpy(dtach_sock[0..dtach_sock_len], path[0..dtach_sock_len]);
+            dtach_sock[dtach_sock_len] = 0;
+        } else {
+            // Create new dtach session
+            const pane_id = uuid.asSlice(&self.id);
+            const dp = std.fmt.bufPrint(&dtach_sock, "/tmp/cmux-dtach-{s}.sock", .{pane_id}) catch return;
+            dtach_sock_len = dp.len;
+            dtach_sock[dtach_sock_len] = 0;
+        }
+
+        // Store on pane for serialization
+        @memcpy(self.dtach_path[0..dtach_sock_len], dtach_sock[0..dtach_sock_len]);
+        self.dtach_path_len = dtach_sock_len;
+
+        // Check if dtach is available
+        const has_dtach = blk: {
+            const pid = std.posix.fork() catch break :blk false;
+            if (pid == 0) {
+                const argv2 = [_:null]?[*:0]const u8{ "dtach", "--help", null };
+                _ = std.posix.execvpeZ("dtach", &argv2, @ptrCast(std.c.environ)) catch {};
+                std.posix.exit(1);
+            }
+            const result = std.posix.waitpid(pid, 0);
+            // dtach --help returns 0 or 1, but if exec fails the child exits with 1
+            _ = result;
+            break :blk true; // if fork succeeded, assume dtach exists
+        };
+        _ = has_dtach;
+
+        // Check if the dtach socket already exists (reattach vs create)
+        const sock_path_z: [*:0]const u8 = dtach_sock[0..dtach_sock_len :0];
+        const socket_exists = std.fs.accessAbsolute(dtach_sock[0..dtach_sock_len], .{}) != error.FileNotFound;
+        _ = socket_exists;
+
+        // Use dtach: -A = attach if exists, create if not
+        // dtach -A /tmp/cmux-dtach-xxx.sock bash
+        const shell_z: [*:0]const u8 = &shell_path_buf;
+        var argv = [_:null]?[*:0]const u8{
+            "dtach", "-A", sock_path_z, "-z", shell_z, null,
+        };
 
         c.vte_terminal_spawn_async(
             terminal,
             c.VTE_PTY_DEFAULT,
             effective_cwd,
             @ptrCast(&argv),
-            null, // env=null → inherit parent (with our CMUX vars)
+            null,
             c.G_SPAWN_DEFAULT,
-            null, null, null, // child setup
-            -1, // timeout
-            null, // cancellable
+            null, null, null,
+            -1,
+            null,
             @ptrCast(&onSpawnComplete),
             null,
         );
@@ -336,6 +385,26 @@ pub const Pane = struct {
     /// Returns the widget for embedding in split tree
     pub fn widget(self: *Pane) *c.GtkWidget {
         return asWidget(self.notebook);
+    }
+
+    /// Reattach the current terminal to an existing dtach session.
+    /// Kills the auto-spawned shell and connects to the dtach socket.
+    pub fn reattachDtach(self: *Pane, dtach_socket: []const u8) void {
+        const term = self.currentTerminal() orelse return;
+
+        // Store the dtach path
+        const dlen = @min(dtach_socket.len, 127);
+        @memcpy(self.dtach_path[0..dlen], dtach_socket[0..dlen]);
+        self.dtach_path[dlen] = 0;
+        self.dtach_path_len = dlen;
+
+        // Feed a command to attach to the dtach socket
+        // This replaces the current shell with dtach
+        var cmd_buf: [256]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&cmd_buf, "exec dtach -a {s}\n", .{dtach_socket}) catch return;
+        c.vte_terminal_feed_child(term, cmd.ptr, @intCast(cmd.len));
+
+        log.info("reattached pane to dtach {s}", .{dtach_socket});
     }
 
     /// Get the currently focused terminal in this pane
