@@ -20,7 +20,8 @@ pub const Workspace = struct {
     container: *c.GtkBox,
     allocator: std.mem.Allocator,
     socket_path: []const u8,
-    minimap_paintable: ?*anyopaque = null, // GdkPaintable* cached for inactive tabs
+    minimap_paintable: ?*anyopaque = null,
+    sidebar: ?SidebarWidgets = null,
 
     /// Claude Code status for sidebar indicator.
     ///
@@ -47,10 +48,19 @@ pub const Workspace = struct {
     claude_message_len: usize = 0,
 
     pub const ClaudeStatus = enum {
-        none,      // no indicator
-        running,   // ✦ star
-        unread,    // ● blue dot (finished, tab not yet viewed)
-        attention, // ● purple dot (needs input/permission)
+        none,
+        running,
+        unread,
+        attention,
+    };
+
+    pub const SidebarWidgets = struct {
+        row_box: *c.GtkBox,
+        indicator_label: *c.GtkLabel,
+        title_label: *c.GtkLabel,
+        message_label: *c.GtkLabel,
+        cwd_label: *c.GtkLabel,
+        minimap_picture: *c.GtkPicture,
     };
 
     pub fn init(allocator: std.mem.Allocator, socket_path: []const u8) !*Workspace {
