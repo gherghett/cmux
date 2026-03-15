@@ -2,6 +2,7 @@
 // All GTK/GLib/VTE types flow through here.
 pub const c = @cImport({
     @cInclude("gtk/gtk.h");
+    @cInclude("glib-unix.h");
     @cInclude("libadwaita-1/adwaita.h");
     @cInclude("vte/vte.h");
     @cInclude("libnotify/notify.h");

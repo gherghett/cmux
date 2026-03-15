@@ -5,6 +5,7 @@ const asWidget = cc.asWidget;
 const TabManager = @import("tab_manager.zig").TabManager;
 const Sidebar = @import("sidebar.zig").Sidebar;
 const SplitTree = @import("split_tree.zig").SplitTree;
+const session = @import("session.zig");
 
 const log = std.log.scoped(.window);
 
@@ -76,10 +77,26 @@ pub const Window = struct {
         // Create the first workspace
         _ = try self.tab_manager.createWorkspace();
 
-        // Set up keyboard shortcuts — pointer to self.tab_manager is stable now
+        // Set up keyboard shortcuts
         self.setupShortcuts();
 
+        // Save session on window close
+        _ = c.g_signal_connect_data(
+            @ptrCast(window),
+            "close-request",
+            @ptrCast(&onCloseRequest),
+            self,
+            null,
+            0,
+        );
+
         return self;
+    }
+
+    fn onCloseRequest(_: *c.GtkWindow, self_ptr: ?*anyopaque) callconv(.C) c.gboolean {
+        const self: *Window = @ptrCast(@alignCast(self_ptr orelse return 0));
+        session.save(&self.tab_manager);
+        return 0; // allow close to proceed
     }
 
     pub fn destroy(self: *Window) void {

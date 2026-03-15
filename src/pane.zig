@@ -249,31 +249,12 @@ pub const Pane = struct {
         @memcpy(self.dtach_path[0..dtach_sock_len], dtach_sock[0..dtach_sock_len]);
         self.dtach_path_len = dtach_sock_len;
 
-        // Check if dtach is available
-        const has_dtach = blk: {
-            const pid = std.posix.fork() catch break :blk false;
-            if (pid == 0) {
-                const argv2 = [_:null]?[*:0]const u8{ "dtach", "--help", null };
-                _ = std.posix.execvpeZ("dtach", &argv2, @ptrCast(std.c.environ)) catch {};
-                std.posix.exit(1);
-            }
-            const result = std.posix.waitpid(pid, 0);
-            // dtach --help returns 0 or 1, but if exec fails the child exits with 1
-            _ = result;
-            break :blk true; // if fork succeeded, assume dtach exists
-        };
-        _ = has_dtach;
-
-        // Check if the dtach socket already exists (reattach vs create)
+        // Build command: dtach -A <socket> -Ez <shell>
+        // -E disables detach char, -z disables suspend
         const sock_path_z: [*:0]const u8 = dtach_sock[0..dtach_sock_len :0];
-        const socket_exists = std.fs.accessAbsolute(dtach_sock[0..dtach_sock_len], .{}) != error.FileNotFound;
-        _ = socket_exists;
-
-        // Use dtach: -A = attach if exists, create if not
-        // dtach -A /tmp/cmux-dtach-xxx.sock bash
         const shell_z: [*:0]const u8 = &shell_path_buf;
         var argv = [_:null]?[*:0]const u8{
-            "dtach", "-A", sock_path_z, "-z", shell_z, null,
+            "dtach", "-A", sock_path_z, "-Ez", shell_z, null,
         };
 
         c.vte_terminal_spawn_async(

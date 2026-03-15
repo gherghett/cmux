@@ -40,11 +40,18 @@ pub fn main() !void {
         @ptrCast(app), "shutdown", @ptrCast(&onShutdown), null, null, 0,
     );
 
+    // Handle SIGTERM/SIGINT to save session before exit
+    _ = c.g_unix_signal_add(15, @ptrCast(&onSignalQuit), app); // SIGTERM
+    _ = c.g_unix_signal_add(2, @ptrCast(&onSignalQuit), app); // SIGINT
+
     const status = c.g_application_run(
         @ptrCast(app),
         @intCast(std.os.argv.len),
         @ptrCast(std.os.argv.ptr),
     );
+
+    // Save session on normal exit too
+    if (g_window) |win| session.save(&win.tab_manager);
 
     if (g_socket) |sock| sock.destroy();
     if (g_notifications) |*notifs| notifs.deinit();
@@ -103,4 +110,11 @@ fn onShutdown(_: *c.GApplication, _: ?*anyopaque) callconv(.C) void {
     if (g_window) |win| {
         session.save(&win.tab_manager);
     }
+}
+
+fn onSignalQuit(app: ?*anyopaque) callconv(.C) c.gboolean {
+    // Save session then quit the GTK app
+    if (g_window) |win| session.save(&win.tab_manager);
+    if (app) |a| c.g_application_quit(@ptrCast(@alignCast(a)));
+    return 0;
 }
