@@ -69,6 +69,35 @@ WS_COUNT=$(echo "$WS_LIST2" | wc -l)
 echo "  restored workspace count: $WS_COUNT"
 
 echo ""
+echo "=== PHASE 4: Close and restart again (dtach still alive — no pkill!) ==="
+kill $(pgrep -f "zig-out/bin/cmux" | head -1) 2>/dev/null
+sleep 3
+
+# Restart WITHOUT killing dtach — this is the real test
+DISPLAY=:99 ./zig-out/bin/cmux >>$LOG 2>&1 &
+sleep 3
+
+if $CLI ping 2>/dev/null; then
+    echo "  cmux restarted with live dtach"
+    WS_LIST3=$($CLI list_workspaces)
+    echo "$WS_LIST3" | grep -q "my-project"; check $? "workspace 'my-project' survives double restart"
+    echo "$WS_LIST3" | grep -q "backend"; check $? "workspace 'backend' survives double restart"
+else
+    check 1 "cmux restart with live dtach"
+    check 1 "workspace 'my-project' survives double restart"
+    check 1 "workspace 'backend' survives double restart"
+fi
+
+echo ""
+echo "=== PHASE 5: Close cleanly ==="
+kill $(pgrep -f "zig-out/bin/cmux" | head -1) 2>/dev/null
+sleep 2
+# Verify no infinite respawn (should be clean exit)
+RESPAWN_COUNT=$(grep -c "shell spawned" $LOG)
+echo "  total shells spawned: $RESPAWN_COUNT"
+[ "$RESPAWN_COUNT" -le 20 ]; check $? "no infinite respawn loop (<20 spawns)"
+
+echo ""
 echo "==========================="
 echo "PASS: $PASS  FAIL: $FAIL"
 echo "==========================="
