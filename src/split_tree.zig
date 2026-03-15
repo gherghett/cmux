@@ -162,6 +162,11 @@ pub const SplitTree = struct {
         c.gtk_paned_set_resize_start_child(paned, 1);
         c.gtk_paned_set_resize_end_child(paned, 1);
 
+        // Set initial 50/50 split position. We need the parent's size
+        // to calculate, but the paned might not be allocated yet.
+        // Use a one-shot idle callback to set position after layout.
+        _ = c.g_idle_add(@ptrCast(&onSetEqualSplit), paned);
+
         // If there was a parent split, update its widget
         if (self.parents.items[split_idx] != INVALID) {
             const gp_idx = self.parents.items[split_idx];
@@ -177,10 +182,8 @@ pub const SplitTree = struct {
         // Focus the new pane
         self.focused = new_leaf_idx;
 
-        log.info("split pane at idx={} direction={s} new_idx={}", .{
-            target_idx,
-            @tagName(direction),
-            new_leaf_idx,
+        log.info("split idx={} dir={s} new_leaf={} split_node={} root={}", .{
+            target_idx, @tagName(direction), new_leaf_idx, split_idx, self.root,
         });
 
         return new_leaf_idx;
@@ -219,15 +222,12 @@ pub const SplitTree = struct {
         const grandparent_idx = self.parents.items[parent_idx];
         self.parents.items[sibling_idx] = grandparent_idx;
 
-        // Clean up the closed pane. Kill dtach if user-initiated.
-        if (kill_dtach) self.nodes.items[idx].leaf.pane.close() else self.nodes.items[idx].leaf.pane.deinit();
-
-        // Remove the CLOSED pane's widget from the old paned.
-        // The sibling stays in place — no reparenting needed.
-        // VTE kills the shell on unrealize, so we must NEVER unparent
-        // the surviving terminal's widget.
+        // Get widget refs BEFORE freeing the pane (use-after-free prevention)
         const closed_widget = self.nodeWidget(idx);
         const old_paned = parent.paned;
+
+        // Clean up the closed pane. Kill dtach if user-initiated.
+        if (kill_dtach) self.nodes.items[idx].leaf.pane.close() else self.nodes.items[idx].leaf.pane.deinit();
         if (c.gtk_paned_get_start_child(old_paned) == closed_widget) {
             c.gtk_paned_set_start_child(old_paned, null);
         } else {
@@ -252,8 +252,8 @@ pub const SplitTree = struct {
         // Focus the sibling (or its first leaf if it's a split)
         self.focused = self.firstLeaf(sibling_idx);
 
-        log.info("closed pane at idx={}, sibling={} now focused={}", .{
-            idx, sibling_idx, self.focused,
+        log.info("closed pane idx={} sibling={} focused={} root={}", .{
+            idx, sibling_idx, self.focused, self.root,
         });
     }
 
@@ -315,6 +315,21 @@ pub const SplitTree = struct {
                 try self.collectPanes(s.second, out);
             },
         }
+    }
+
+    fn onSetEqualSplit(user_data: ?*anyopaque) callconv(.C) c.gboolean {
+        const paned: *c.GtkPaned = @ptrCast(@alignCast(user_data orelse return 0));
+        const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(paned)));
+        const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
+            c.gtk_widget_get_width(asWidget(paned))
+        else
+            c.gtk_widget_get_height(asWidget(paned));
+
+        if (total > 0) {
+            c.gtk_paned_set_position(paned, @divTrunc(total, 2));
+            return 0; // done
+        }
+        return 1; // try again next idle
     }
 
     // --- Internal helpers ---

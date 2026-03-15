@@ -247,16 +247,45 @@ pub const Sidebar = struct {
 
     // === Text-based minimap drawing ===
 
-    // Manual definition of VteCharAttributes — Zig's cImport makes it opaque
-    // due to the bitfield members. Layout must match the C struct on x86_64.
-    const PangoColor = extern struct { red: u16, green: u16, blue: u16 };
-    const VteCharAttr = extern struct {
-        row: c_long,
-        column: c_long,
-        fore: PangoColor,
-        back: PangoColor,
-        _bitfield: c_uint,
-    };
+    const Color = struct { r: f64, g: f64, b: f64 };
+    const default_color = Color{ .r = 0.68, .g = 0.74, .b = 0.82 };
+
+    fn parseHexColor(hex: []const u8) ?Color {
+        if (hex.len < 7 or hex[0] != '#') return null;
+        const r = std.fmt.parseInt(u8, hex[1..3], 16) catch return null;
+        const g = std.fmt.parseInt(u8, hex[3..5], 16) catch return null;
+        const b = std.fmt.parseInt(u8, hex[5..7], 16) catch return null;
+        return .{
+            .r = @as(f64, @floatFromInt(r)) / 255.0,
+            .g = @as(f64, @floatFromInt(g)) / 255.0,
+            .b = @as(f64, @floatFromInt(b)) / 255.0,
+        };
+    }
+
+    /// Extract foreground color from an HTML tag.
+    /// Handles both <font color="#rrggbb"> and <span style="color:#rrggbb">.
+    fn extractFgColor(tag: []const u8) ?Color {
+        // <font color="#rrggbb">
+        if (std.mem.indexOf(u8, tag, "color=\"#")) |idx| {
+            const after = tag[idx + 7 ..];
+            if (after.len >= 7) return parseHexColor(after[0..7]);
+        }
+        // <span style="color:#rrggbb"> (but not background-color:)
+        const needle = "color:";
+        var search_pos: usize = 0;
+        while (std.mem.indexOfPos(u8, tag, search_pos, needle)) |idx| {
+            if (idx > 0 and tag[idx - 1] == '-') {
+                search_pos = idx + needle.len;
+                continue;
+            }
+            const after = tag[idx + needle.len ..];
+            if (after.len >= 7 and after[0] == '#') {
+                return parseHexColor(after[0..7]);
+            }
+            break;
+        }
+        return null;
+    }
 
     fn utf8SeqLen(byte: u8) usize {
         if (byte < 0x80) return 1;
@@ -367,20 +396,12 @@ pub const Sidebar = struct {
         const ph = layout.h - inset * 2;
         const char_h = ph / @as(f64, @floatFromInt(rows));
 
-        // Get terminal text with per-character color attributes (deprecated API for colors)
-        const attrs = c.g_array_new(0, 1, @sizeOf(VteCharAttr));
-        defer c.g_array_unref(attrs);
-        const text_ptr: ?[*:0]u8 = @ptrCast(c.vte_terminal_get_text(term, null, null, attrs));
-        if (text_ptr == null) return;
-        defer c.g_free(text_ptr);
-        const text = std.mem.span(text_ptr.?);
-
-        const has_attrs = attrs.*.len > 0 and attrs.*.data != null;
-        const attr_data: ?[*]const VteCharAttr = if (has_attrs)
-            @ptrCast(@alignCast(attrs.*.data))
-        else
-            null;
-        const attr_count: usize = attrs.*.len;
+        // Get HTML-formatted terminal text (includes color via <span style="color:#rrggbb">)
+        const html_ptr: ?[*:0]u8 = @ptrCast(c.vte_terminal_get_text_format(term, c.VTE_FORMAT_HTML));
+        if (html_ptr == null) return;
+        defer c.g_free(html_ptr);
+        const html = std.mem.span(html_ptr.?);
+        if (html.len < 10) return;
 
         // Set up tiny monospace font scaled to cell height
         c.cairo_select_font_face(cairo, "monospace", c.CAIRO_FONT_SLANT_NORMAL, c.CAIRO_FONT_WEIGHT_NORMAL);
@@ -394,75 +415,107 @@ pub const Sidebar = struct {
         const target_advance = pw / @as(f64, @floatFromInt(cols));
         const x_scale = if (natural_advance > 0) target_advance / natural_advance else 1.0;
 
-        // Render row by row, character by character with colors
-        var attr_idx: usize = 0;
-        var row_start: usize = 0;
+        // Skip <pre> wrapper and its trailing newline
+        var content: []const u8 = html;
+        if (std.mem.startsWith(u8, content, "<pre>")) {
+            content = content[5..];
+            if (content.len > 0 and content[0] == '\n') content = content[1..];
+        }
+        // Strip trailing </pre>
+        if (std.mem.endsWith(u8, content, "</pre>")) {
+            content = content[0 .. content.len - 6];
+        }
+        if (content.len > 0 and content[content.len - 1] == '\n') {
+            content = content[0 .. content.len - 1];
+        }
+
+        // Parse HTML and render character by character with colors
+        var cur_color = default_color;
         var row: usize = 0;
-        var i: usize = 0;
+        var row_open = false;
+        var pos: usize = 0;
+        var color_set = false;
 
-        while (i <= text.len) : (i += 1) {
-            const at_end = i == text.len;
-            const is_newline = !at_end and text[i] == '\n';
+        while (pos < content.len and row < @as(usize, @intCast(rows))) {
+            if (content[pos] == '<') {
+                // HTML tag — find closing '>'
+                const end = std.mem.indexOfScalarPos(u8, content, pos + 1, '>') orelse break;
+                const tag = content[pos .. end + 1];
 
-            if (at_end or is_newline) {
-                if (row >= @as(usize, @intCast(rows))) break;
-                const row_text = text[row_start..i];
+                if (std.mem.startsWith(u8, tag, "<font") or std.mem.startsWith(u8, tag, "<span")) {
+                    if (extractFgColor(tag)) |col| {
+                        cur_color = col;
+                        color_set = false;
+                    }
+                } else if (std.mem.startsWith(u8, tag, "</font") or std.mem.startsWith(u8, tag, "</span")) {
+                    cur_color = default_color;
+                    color_set = false;
+                }
+                // <b>, </b>, etc. — just skip
+                pos = end + 1;
+            } else if (content[pos] == '&') {
+                // HTML entity → decode to single character
+                const semi = std.mem.indexOfScalarPos(u8, content, pos + 1, ';') orelse {
+                    pos += 1;
+                    continue;
+                };
+                const entity = content[pos .. semi + 1];
+                const decoded: u8 = if (std.mem.eql(u8, entity, "&amp;"))
+                    '&'
+                else if (std.mem.eql(u8, entity, "&lt;"))
+                    '<'
+                else if (std.mem.eql(u8, entity, "&gt;"))
+                    '>'
+                else if (std.mem.eql(u8, entity, "&quot;"))
+                    '"'
+                else
+                    '?';
 
-                if (row_text.len > 0) {
+                if (!row_open) {
                     c.cairo_save(cairo);
                     c.cairo_translate(cairo, px, py + @as(f64, @floatFromInt(row)) * char_h + char_h * 0.85);
                     c.cairo_scale(cairo, x_scale, 1.0);
                     c.cairo_move_to(cairo, 0, 0);
-
-                    // Per-character rendering with color from attributes
-                    var byte_pos: usize = 0;
-                    var prev_r: u16 = std.math.maxInt(u16);
-                    var prev_g: u16 = std.math.maxInt(u16);
-                    var prev_b: u16 = std.math.maxInt(u16);
-
-                    while (byte_pos < row_text.len) {
-                        const seq_len = @min(utf8SeqLen(row_text[byte_pos]), row_text.len - byte_pos);
-
-                        // Set color from VTE attributes
-                        if (attr_data) |ad| {
-                            if (attr_idx < attr_count) {
-                                const a = ad[attr_idx];
-                                if (a.fore.red != prev_r or a.fore.green != prev_g or a.fore.blue != prev_b) {
-                                    c.cairo_set_source_rgba(cairo,
-                                        @as(f64, @floatFromInt(a.fore.red)) / 65535.0,
-                                        @as(f64, @floatFromInt(a.fore.green)) / 65535.0,
-                                        @as(f64, @floatFromInt(a.fore.blue)) / 65535.0,
-                                        0.85,
-                                    );
-                                    prev_r = a.fore.red;
-                                    prev_g = a.fore.green;
-                                    prev_b = a.fore.blue;
-                                }
-                            }
-                        } else {
-                            if (prev_r == std.math.maxInt(u16)) {
-                                c.cairo_set_source_rgba(cairo, 0.68, 0.74, 0.82, 0.85);
-                                prev_r = 0;
-                            }
-                        }
-
-                        // Render single character
-                        var char_buf: [5]u8 = undefined;
-                        @memcpy(char_buf[0..seq_len], row_text[byte_pos..][0..seq_len]);
-                        char_buf[seq_len] = 0;
-                        c.cairo_show_text(cairo, &char_buf);
-
-                        byte_pos += seq_len;
-                        attr_idx += 1;
-                    }
-
+                    row_open = true;
+                }
+                if (!color_set) {
+                    c.cairo_set_source_rgba(cairo, cur_color.r, cur_color.g, cur_color.b, 0.85);
+                    color_set = true;
+                }
+                var buf = [2]u8{ decoded, 0 };
+                c.cairo_show_text(cairo, &buf);
+                pos = semi + 1;
+            } else if (content[pos] == '\n') {
+                if (row_open) {
                     c.cairo_restore(cairo);
+                    row_open = false;
+                }
+                row += 1;
+                pos += 1;
+            } else {
+                // Regular text character (possibly multi-byte UTF-8)
+                if (!row_open) {
+                    c.cairo_save(cairo);
+                    c.cairo_translate(cairo, px, py + @as(f64, @floatFromInt(row)) * char_h + char_h * 0.85);
+                    c.cairo_scale(cairo, x_scale, 1.0);
+                    c.cairo_move_to(cairo, 0, 0);
+                    row_open = true;
+                }
+                if (!color_set) {
+                    c.cairo_set_source_rgba(cairo, cur_color.r, cur_color.g, cur_color.b, 0.85);
+                    color_set = true;
                 }
 
-                row += 1;
-                row_start = i + 1;
+                const seq_len = @min(utf8SeqLen(content[pos]), content.len - pos);
+                var char_buf: [5]u8 = undefined;
+                @memcpy(char_buf[0..seq_len], content[pos..][0..seq_len]);
+                char_buf[seq_len] = 0;
+                c.cairo_show_text(cairo, &char_buf);
+                pos += seq_len;
             }
         }
+
+        if (row_open) c.cairo_restore(cairo);
 
         // Subtle pane border
         c.cairo_set_source_rgba(cairo, 0.3, 0.3, 0.4, 0.4);
