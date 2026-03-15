@@ -6,6 +6,7 @@ const uuid = @import("uuid.zig");
 const TabManager = @import("tab_manager.zig").TabManager;
 const Workspace = @import("workspace.zig").Workspace;
 const Pane = @import("pane.zig").Pane;
+const SplitTree = @import("split_tree.zig").SplitTree;
 
 const log = std.log.scoped(.sidebar);
 
@@ -146,13 +147,13 @@ pub const Sidebar = struct {
         c.gtk_widget_add_css_class(asWidget(cwd_label), "caption");
         c.gtk_box_append(row_box, asWidget(cwd_label));
 
-        // Row 4: minimap
-        const minimap_picture: *c.GtkPicture = @ptrCast(@alignCast(
-            c.gtk_picture_new() orelse return,
+        // Row 4: minimap (text-based via Cairo)
+        const minimap_area: *c.GtkDrawingArea = @ptrCast(@alignCast(
+            c.gtk_drawing_area_new() orelse return,
         ));
-        c.gtk_picture_set_content_fit(minimap_picture, c.GTK_CONTENT_FIT_CONTAIN);
-        c.gtk_widget_set_size_request(asWidget(minimap_picture), -1, 48);
-        c.gtk_box_append(row_box, asWidget(minimap_picture));
+        c.gtk_widget_set_size_request(asWidget(minimap_area), -1, 48);
+        c.gtk_drawing_area_set_draw_func(minimap_area, @ptrCast(&onMinimapDraw), ws, null);
+        c.gtk_box_append(row_box, asWidget(minimap_area));
 
         // Right-click menu
         const click = c.gtk_gesture_click_new() orelse return;
@@ -171,7 +172,7 @@ pub const Sidebar = struct {
             .title_label = title_label,
             .message_label = message_label,
             .cwd_label = cwd_label,
-            .minimap_picture = minimap_picture,
+            .minimap_area = minimap_area,
         };
     }
 
@@ -220,14 +221,9 @@ pub const Sidebar = struct {
             c.gtk_widget_set_visible(asWidget(sb.cwd_label), 0);
         }
 
-        // Minimap
-        if (ws.minimap_paintable) |p| {
-            c.gtk_picture_set_paintable(sb.minimap_picture, @ptrCast(@alignCast(p)));
-            c.gtk_widget_set_opacity(asWidget(sb.minimap_picture), if (is_active) 0.8 else 0.6);
-            c.gtk_widget_set_visible(asWidget(sb.minimap_picture), 1);
-        } else {
-            c.gtk_widget_set_visible(asWidget(sb.minimap_picture), 0);
-        }
+        // Minimap — queue redraw (text-based, works for all workspaces)
+        c.gtk_widget_set_opacity(asWidget(sb.minimap_area), if (is_active) 0.9 else 0.6);
+        c.gtk_widget_queue_draw(asWidget(sb.minimap_area));
     }
 
     // === Periodic timer ===
@@ -235,12 +231,7 @@ pub const Sidebar = struct {
     fn onPeriodicRefresh(user_data: ?*anyopaque) callconv(.C) c.gboolean {
         const self: *Sidebar = @ptrCast(@alignCast(user_data orelse return 0));
 
-        // Snapshot minimap for active workspace
-        if (self.tab_manager.current()) |ws| {
-            updateMinimapSnapshot(ws);
-        }
-
-        // Update all rows in-place (no rebuild)
+        // Update all rows in-place (minimaps redraw via queue_draw)
         self.updateAll();
 
         // Poll CDP
@@ -254,24 +245,230 @@ pub const Sidebar = struct {
         return 1;
     }
 
-    fn updateMinimapSnapshot(ws: *Workspace) void {
-        const live = c.gtk_widget_paintable_new(ws.containerWidget());
-        if (live) |live_p| {
-            defer c.g_object_unref(live_p);
-            const paintable: *c.GdkPaintable = @ptrCast(@alignCast(live_p));
-            const w = c.gdk_paintable_get_intrinsic_width(paintable);
-            const h = c.gdk_paintable_get_intrinsic_height(paintable);
-            if (w > 0 and h > 0) {
-                const snap = c.gtk_snapshot_new();
-                c.gdk_paintable_snapshot(paintable, @ptrCast(@alignCast(snap)), @floatFromInt(w), @floatFromInt(h));
-                const size = c.graphene_size_t{ .width = @floatFromInt(w), .height = @floatFromInt(h) };
-                const static_p = c.gtk_snapshot_free_to_paintable(snap, &size);
-                if (static_p) |sp| {
-                    if (ws.minimap_paintable) |old| c.g_object_unref(@ptrCast(@alignCast(old)));
-                    ws.minimap_paintable = @ptrCast(sp);
+    // === Text-based minimap drawing ===
+
+    // Manual definition of VteCharAttributes — Zig's cImport makes it opaque
+    // due to the bitfield members. Layout must match the C struct on x86_64.
+    const PangoColor = extern struct { red: u16, green: u16, blue: u16 };
+    const VteCharAttr = extern struct {
+        row: c_long,
+        column: c_long,
+        fore: PangoColor,
+        back: PangoColor,
+        _bitfield: c_uint,
+    };
+
+    fn utf8SeqLen(byte: u8) usize {
+        if (byte < 0x80) return 1;
+        if (byte < 0xE0) return 2;
+        if (byte < 0xF0) return 3;
+        return 4;
+    }
+
+    const PaneLayout = struct {
+        pane: *Pane,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    };
+
+    fn onMinimapDraw(
+        _: *c.GtkDrawingArea,
+        cr: ?*c.cairo_t,
+        width: c_int,
+        height: c_int,
+        user_data: ?*anyopaque,
+    ) callconv(.C) void {
+        const ws: *Workspace = @ptrCast(@alignCast(user_data orelse return));
+        const cairo = cr orelse return;
+        const w: f64 = @floatFromInt(width);
+        const h: f64 = @floatFromInt(height);
+
+        // Dark background
+        c.cairo_set_source_rgb(cairo, 0.08, 0.08, 0.1);
+        c.cairo_rectangle(cairo, 0, 0, w, h);
+        c.cairo_fill(cairo);
+
+        if (ws.split_tree.root == SplitTree.INVALID) return;
+
+        // Collect pane layout rectangles from split tree
+        var layouts: [16]PaneLayout = undefined;
+        var layout_count: usize = 0;
+        collectPaneLayouts(&ws.split_tree, ws.split_tree.root, 0, 0, w, h, &layouts, &layout_count);
+
+        // Draw each pane
+        for (layouts[0..layout_count]) |layout| {
+            drawPaneMinimap(cairo, layout);
+        }
+    }
+
+    fn collectPaneLayouts(
+        tree: *const SplitTree,
+        idx: SplitTree.NodeIndex,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        out: *[16]PaneLayout,
+        count: *usize,
+    ) void {
+        if (idx == SplitTree.INVALID or idx >= tree.nodes.items.len) return;
+        if (count.* >= 16) return;
+
+        switch (tree.nodes.items[idx]) {
+            .leaf => |leaf| {
+                out[count.*] = .{ .pane = leaf.pane, .x = x, .y = y, .w = w, .h = h };
+                count.* += 1;
+            },
+            .split => |s| {
+                const ratio = getPanedRatio(s);
+                switch (s.direction) {
+                    .horizontal => {
+                        // Horizontal split = panes stacked vertically
+                        collectPaneLayouts(tree, s.first, x, y, w, h * ratio, out, count);
+                        collectPaneLayouts(tree, s.second, x, y + h * ratio, w, h * (1.0 - ratio), out, count);
+                    },
+                    .vertical => {
+                        // Vertical split = panes side by side
+                        collectPaneLayouts(tree, s.first, x, y, w * ratio, h, out, count);
+                        collectPaneLayouts(tree, s.second, x + w * ratio, y, w * (1.0 - ratio), h, out, count);
+                    },
                 }
+            },
+        }
+    }
+
+    fn getPanedRatio(s: SplitTree.SplitNode) f64 {
+        const pos = c.gtk_paned_get_position(s.paned);
+        if (pos <= 0) return 0.5;
+
+        const total: c_int = switch (s.direction) {
+            .horizontal => c.gtk_widget_get_height(asWidget(s.paned)),
+            .vertical => c.gtk_widget_get_width(asWidget(s.paned)),
+        };
+        if (total <= 0) return 0.5;
+        const r = @as(f64, @floatFromInt(pos)) / @as(f64, @floatFromInt(total));
+        return std.math.clamp(r, 0.1, 0.9);
+    }
+
+    fn drawPaneMinimap(cairo: *c.cairo_t, layout: PaneLayout) void {
+        const term = layout.pane.currentTerminal() orelse return;
+
+        const cols = c.vte_terminal_get_column_count(term);
+        const rows = c.vte_terminal_get_row_count(term);
+        if (cols <= 0 or rows <= 0) return;
+
+        // Inset slightly for pane borders
+        const inset: f64 = 0.5;
+        const px = layout.x + inset;
+        const py = layout.y + inset;
+        const pw = layout.w - inset * 2;
+        const ph = layout.h - inset * 2;
+        const char_h = ph / @as(f64, @floatFromInt(rows));
+
+        // Get terminal text with per-character color attributes (deprecated API for colors)
+        const attrs = c.g_array_new(0, 1, @sizeOf(VteCharAttr));
+        defer c.g_array_unref(attrs);
+        const text_ptr: ?[*:0]u8 = @ptrCast(c.vte_terminal_get_text(term, null, null, attrs));
+        if (text_ptr == null) return;
+        defer c.g_free(text_ptr);
+        const text = std.mem.span(text_ptr.?);
+
+        const has_attrs = attrs.*.len > 0 and attrs.*.data != null;
+        const attr_data: ?[*]const VteCharAttr = if (has_attrs)
+            @ptrCast(@alignCast(attrs.*.data))
+        else
+            null;
+        const attr_count: usize = attrs.*.len;
+
+        // Set up tiny monospace font scaled to cell height
+        c.cairo_select_font_face(cairo, "monospace", c.CAIRO_FONT_SLANT_NORMAL, c.CAIRO_FONT_WEIGHT_NORMAL);
+        const font_size = @max(char_h * 1.2, 1.5);
+        c.cairo_set_font_size(cairo, font_size);
+
+        // Horizontal squeeze: scale natural monospace advance to target cell width
+        var font_ext: c.cairo_font_extents_t = undefined;
+        c.cairo_font_extents(cairo, &font_ext);
+        const natural_advance = font_ext.max_x_advance;
+        const target_advance = pw / @as(f64, @floatFromInt(cols));
+        const x_scale = if (natural_advance > 0) target_advance / natural_advance else 1.0;
+
+        // Render row by row, character by character with colors
+        var attr_idx: usize = 0;
+        var row_start: usize = 0;
+        var row: usize = 0;
+        var i: usize = 0;
+
+        while (i <= text.len) : (i += 1) {
+            const at_end = i == text.len;
+            const is_newline = !at_end and text[i] == '\n';
+
+            if (at_end or is_newline) {
+                if (row >= @as(usize, @intCast(rows))) break;
+                const row_text = text[row_start..i];
+
+                if (row_text.len > 0) {
+                    c.cairo_save(cairo);
+                    c.cairo_translate(cairo, px, py + @as(f64, @floatFromInt(row)) * char_h + char_h * 0.85);
+                    c.cairo_scale(cairo, x_scale, 1.0);
+                    c.cairo_move_to(cairo, 0, 0);
+
+                    // Per-character rendering with color from attributes
+                    var byte_pos: usize = 0;
+                    var prev_r: u16 = std.math.maxInt(u16);
+                    var prev_g: u16 = std.math.maxInt(u16);
+                    var prev_b: u16 = std.math.maxInt(u16);
+
+                    while (byte_pos < row_text.len) {
+                        const seq_len = @min(utf8SeqLen(row_text[byte_pos]), row_text.len - byte_pos);
+
+                        // Set color from VTE attributes
+                        if (attr_data) |ad| {
+                            if (attr_idx < attr_count) {
+                                const a = ad[attr_idx];
+                                if (a.fore.red != prev_r or a.fore.green != prev_g or a.fore.blue != prev_b) {
+                                    c.cairo_set_source_rgba(cairo,
+                                        @as(f64, @floatFromInt(a.fore.red)) / 65535.0,
+                                        @as(f64, @floatFromInt(a.fore.green)) / 65535.0,
+                                        @as(f64, @floatFromInt(a.fore.blue)) / 65535.0,
+                                        0.85,
+                                    );
+                                    prev_r = a.fore.red;
+                                    prev_g = a.fore.green;
+                                    prev_b = a.fore.blue;
+                                }
+                            }
+                        } else {
+                            if (prev_r == std.math.maxInt(u16)) {
+                                c.cairo_set_source_rgba(cairo, 0.68, 0.74, 0.82, 0.85);
+                                prev_r = 0;
+                            }
+                        }
+
+                        // Render single character
+                        var char_buf: [5]u8 = undefined;
+                        @memcpy(char_buf[0..seq_len], row_text[byte_pos..][0..seq_len]);
+                        char_buf[seq_len] = 0;
+                        c.cairo_show_text(cairo, &char_buf);
+
+                        byte_pos += seq_len;
+                        attr_idx += 1;
+                    }
+
+                    c.cairo_restore(cairo);
+                }
+
+                row += 1;
+                row_start = i + 1;
             }
         }
+
+        // Subtle pane border
+        c.cairo_set_source_rgba(cairo, 0.3, 0.3, 0.4, 0.4);
+        c.cairo_set_line_width(cairo, 0.5);
+        c.cairo_rectangle(cairo, layout.x, layout.y, layout.w, layout.h);
+        c.cairo_stroke(cairo);
     }
 
     // === Helpers ===

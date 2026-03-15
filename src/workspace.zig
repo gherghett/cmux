@@ -20,7 +20,7 @@ pub const Workspace = struct {
     container: *c.GtkBox,
     allocator: std.mem.Allocator,
     socket_path: []const u8,
-    minimap_paintable: ?*anyopaque = null,
+    minimap_dirty: bool = true,
     sidebar: ?SidebarWidgets = null,
 
     /// Claude Code status for sidebar indicator.
@@ -60,7 +60,7 @@ pub const Workspace = struct {
         title_label: *c.GtkLabel,
         message_label: *c.GtkLabel,
         cwd_label: *c.GtkLabel,
-        minimap_picture: *c.GtkPicture,
+        minimap_area: *c.GtkDrawingArea,
     };
 
     pub fn init(allocator: std.mem.Allocator, socket_path: []const u8) !*Workspace {
@@ -108,6 +108,7 @@ pub const Workspace = struct {
         c.gtk_box_append(box, pane_w);
 
         _ = try pane.addTab(null);
+        pane.waitReady();
 
         log.info("created workspace {s}", .{uuid.asSlice(&id)});
         return ws;
@@ -191,6 +192,7 @@ pub const Workspace = struct {
         new_pane.node_index = new_idx;
         self.updateContainer();
         _ = try new_pane.addTabDtach(cwd, dtach_socket);
+        new_pane.waitReady();
     }
 
     pub fn closeFocused(self: *Workspace) void {
@@ -309,5 +311,6 @@ pub const Workspace = struct {
         c.gtk_box_append(self.container, pane_w);
 
         _ = try pane.addTab(null);
+        pane.waitReady();
     }
 };

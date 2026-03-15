@@ -17,7 +17,8 @@ check() {
 
 pkill -9 -f Xvfb 2>/dev/null || true
 pkill -9 -f "zig-out/bin/cmux" 2>/dev/null || true
-rm -f /tmp/cmux.sock
+pkill -f "dtach.*cmux-dtach" 2>/dev/null || true
+rm -f /tmp/cmux.sock /tmp/cmux-session/layout.json /tmp/cmux-dtach-*.sock
 sleep 1
 
 Xvfb :99 -screen 0 1280x1024x24 &>/dev/null &

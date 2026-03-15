@@ -18,6 +18,8 @@ pub const Pane = struct {
     /// dtach socket path for this pane's primary terminal
     dtach_path: [128]u8 = undefined,
     dtach_path_len: usize = 0,
+    /// True once the shell/dtach process has started (onSpawnComplete fired).
+    ready: bool = false,
 
     /// Index of this pane's node in the split tree (set after insertion).
     node_index: u16 = std.math.maxInt(u16),
@@ -78,6 +80,21 @@ pub const Pane = struct {
         };
 
         return pane;
+    }
+
+    /// Block until the spawn callback fires (process is running).
+    /// Pumps the GTK main loop so async spawn can complete.
+    /// Times out after ~2 seconds to avoid deadlock.
+    pub fn waitReady(self: *Pane) void {
+        var attempts: u32 = 0;
+        while (!self.ready and attempts < 200) : (attempts += 1) {
+            // Pump the GTK main loop so VTE's async spawn can complete
+            _ = c.g_main_context_iteration(null, 0);
+            std.time.sleep(10_000_000); // 10ms
+        }
+        if (!self.ready) {
+            log.warn("pane spawn timed out after 2 seconds", .{});
+        }
     }
 
     /// Disconnect signals only — dtach process stays alive for session persistence.
@@ -293,7 +310,7 @@ pub const Pane = struct {
             -1,
             null,
             @ptrCast(&onSpawnComplete),
-            null,
+            self,
         );
     }
 
@@ -929,16 +946,19 @@ pub const Pane = struct {
     }
 
     fn onSpawnComplete(
-        terminal: *c.VteTerminal,
+        _: *c.VteTerminal,
         pid: c.GPid,
         err: ?*c.GError,
-        _: ?*anyopaque,
+        user_data: ?*anyopaque,
     ) callconv(.C) void {
-        _ = terminal;
         if (err) |e| {
             log.err("spawn failed: {s}", .{@as([*:0]const u8, @ptrCast(e.message))});
         } else {
             log.info("shell spawned with pid {}", .{pid});
+        }
+        if (user_data) |ud| {
+            const pane: *Pane = @ptrCast(@alignCast(ud));
+            pane.ready = true;
         }
     }
 
