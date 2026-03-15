@@ -114,25 +114,15 @@ pub const Pane = struct {
             const path = self.dtach_path[0..self.dtach_path_len];
             log.info("killing dtach at {s}", .{path});
 
-            // Send SIGHUP to the dtach process via its socket.
-            // dtach -p sends stdin to the session, but to kill it we
-            // need to find and signal the process directly.
-            // Use pkill to find dtach by its socket path argument.
-            const pid = std.posix.fork() catch return;
-            if (pid == 0) {
-                var path_z: [129]u8 = undefined;
-                @memcpy(path_z[0..path.len], path);
-                path_z[path.len] = 0;
-                const argv = [_:null]?[*:0]const u8{
-                    "pkill", "-f", path_z[0..path.len :0], null,
-                };
-                _ = std.posix.execvpeZ("pkill", &argv, @ptrCast(std.c.environ)) catch {};
-                std.posix.exit(1);
-            }
-            _ = std.posix.waitpid(pid, 0);
-
-            // Also remove the socket file
+            // Remove the socket file first — prevents dtach from accepting
+            // new connections. Then send exit to the terminal which causes
+            // the shell to exit, making dtach exit naturally.
             std.fs.deleteFileAbsolute(path) catch {};
+
+            // Feed "exit\n" to our VTE terminal to kill the shell inside dtach
+            if (self.currentTerminal()) |term| {
+                c.vte_terminal_feed_child(term, "exit\n", 5);
+            }
         }
     }
 

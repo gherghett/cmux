@@ -231,6 +231,9 @@ pub const Sidebar = struct {
     fn onPeriodicRefresh(user_data: ?*anyopaque) callconv(.C) c.gboolean {
         const self: *Sidebar = @ptrCast(@alignCast(user_data orelse return 0));
 
+        // Stop if GTK is shutting down
+        if (c.g_application_get_default() == null) return 0;
+
         // Update all rows in-place (minimaps redraw via queue_draw)
         self.updateAll();
 
