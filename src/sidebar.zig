@@ -400,8 +400,41 @@ pub const Sidebar = struct {
             0,
         );
 
+        // "Close" button
+        const close_btn = c.gtk_button_new_with_label("Close") orelse return;
+        c.gtk_button_set_has_frame(@ptrCast(@alignCast(close_btn)), 0);
+        c.gtk_box_append(menu_box, close_btn);
+
+        c.g_object_set_data(@ptrCast(@alignCast(close_btn)), "cmux-popover", popover);
+        c.g_object_set_data(@ptrCast(@alignCast(close_btn)), "cmux-sidebar", sidebar);
+        c.g_object_set_data(@ptrCast(@alignCast(close_btn)), "cmux-ws", ws);
+
+        _ = c.g_signal_connect_data(
+            @ptrCast(close_btn),
+            "clicked",
+            @ptrCast(&onCloseClicked),
+            null,
+            null,
+            0,
+        );
+
         c.gtk_popover_set_child(popover, asWidget(menu_box));
         c.gtk_popover_popup(popover);
+    }
+
+    fn onCloseClicked(button: *c.GtkButton, _: ?*anyopaque) callconv(.C) void {
+        const btn_widget = asWidget(button);
+        const popover_raw = c.g_object_get_data(@ptrCast(@alignCast(btn_widget)), "cmux-popover") orelse return;
+        const popover: *c.GtkPopover = @ptrCast(@alignCast(popover_raw));
+        const sidebar_raw = c.g_object_get_data(@ptrCast(@alignCast(btn_widget)), "cmux-sidebar") orelse return;
+        const sidebar: *Sidebar = @ptrCast(@alignCast(sidebar_raw));
+        const ws_raw = c.g_object_get_data(@ptrCast(@alignCast(btn_widget)), "cmux-ws") orelse return;
+        const ws: *Workspace = @ptrCast(@alignCast(ws_raw));
+
+        c.gtk_popover_popdown(popover);
+
+        var ws_id = ws.id;
+        sidebar.tab_manager.closeWorkspace(&ws_id);
     }
 
     fn onRenameClicked(button: *c.GtkButton, _: ?*anyopaque) callconv(.C) void {
