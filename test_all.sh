@@ -77,9 +77,43 @@ done
 R=$($CLI ping 2>&1); [ "$R" = "PONG" ]; check $? "alive after 5 split+close cycles"
 
 echo ""
+echo "--- Dtach cleanup ---"
+# Count dtach sockets — should match number of live panes
+DTACH_SOCKS=$(ls /tmp/cmux-dtach-*.sock 2>/dev/null | wc -l)
+DTACH_PROCS=$(ps aux | grep "dtach.*cmux-dtach" | grep -v grep | wc -l)
+echo "  dtach sockets: $DTACH_SOCKS, processes: $DTACH_PROCS"
+
+# Close the workspace (should kill its dtach processes)
+WS=$($CLI current_workspace 2>/dev/null | cut -f1)
+$CLI close_workspace "$WS" >/dev/null 2>&1
+sleep 1
+
+# After closing, only the fresh default workspace's dtach should remain
+DTACH_AFTER=$(ps aux | grep "dtach.*cmux-dtach" | grep -v grep | wc -l)
+echo "  dtach after close: $DTACH_AFTER"
+# Expect <=2: 1 for the fresh default workspace + possibly 1 lingering from stability test
+[ "$DTACH_AFTER" -le 2 ]; check $? "no orphaned dtach after close_workspace"
+
+# Close cmux and verify ALL dtach are cleaned or intentionally alive
+kill $(pgrep -f "zig-out/bin/cmux" | head -1) 2>/dev/null
+sleep 2
+DTACH_FINAL=$(ps aux | grep "dtach.*cmux-dtach" | grep -v grep | wc -l)
+SOCK_FINAL=$(ls /tmp/cmux-dtach-*.sock 2>/dev/null | wc -l)
+echo "  dtach after cmux exit: $DTACH_FINAL procs, $SOCK_FINAL sockets"
+# After cmux exit, dtach SHOULD still be alive (session persistence)
+[ "$DTACH_FINAL" -ge 1 ]; check $? "dtach survives cmux exit (persistence)"
+
+# Now kill dtach and verify clean
+pkill -f "dtach.*cmux-dtach" 2>/dev/null || true
+sleep 1
+DTACH_CLEANED=$(ps aux | grep "dtach.*cmux-dtach" | grep -v grep | wc -l)
+[ "$DTACH_CLEANED" -eq 0 ]; check $? "dtach fully cleaned after kill"
+
+echo ""
 echo "==========================="
 echo "PASS: $PASS  FAIL: $FAIL"
 echo "==========================="
 
 pkill -9 -f Xvfb 2>/dev/null || true
 pkill -9 -f "zig-out/bin/cmux" 2>/dev/null || true
+rm -f /tmp/cmux-dtach-*.sock /tmp/cmux-session/layout.json
