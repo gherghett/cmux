@@ -116,9 +116,23 @@ pub const Sidebar = struct {
     /// Rebuild the sidebar from workspace state. Tracks version to avoid redundant rebuilds.
 
     pub fn refresh(self: *Sidebar) void {
-        // Remove all existing rows
+        // Remove all existing rows. Unparent popovers first to avoid
+        // "Finalizing GtkListBoxRow but it still has children" warnings.
         while (c.gtk_list_box_get_row_at_index(self.list_box, 0)) |row| {
-            c.gtk_list_box_remove(self.list_box, asWidget(row));
+            const row_w = asWidget(row);
+            // Walk children and unparent any GtkPopovers
+            var child = c.gtk_widget_get_first_child(row_w);
+            while (child) |ch| {
+                const next = c.gtk_widget_get_next_sibling(ch);
+                if (c.g_type_check_instance_is_a(
+                    @ptrCast(@alignCast(ch)),
+                    c.gtk_popover_get_type(),
+                ) != 0) {
+                    c.gtk_widget_unparent(ch);
+                }
+                child = next;
+            }
+            c.gtk_list_box_remove(self.list_box, row_w);
         }
 
         for (self.tab_manager.workspaces.items, 0..) |ws, i| {
