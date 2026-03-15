@@ -9,6 +9,21 @@ const Pane = @import("pane.zig").Pane;
 const SplitTree = @import("split_tree.zig").SplitTree;
 
 const log = std.log.scoped(.session);
+const posix = std.posix;
+
+/// Check if a dtach socket is alive (a dtach process is listening).
+fn socketAlive(path: []const u8) bool {
+    const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch return false;
+    defer posix.close(fd);
+
+    var addr: posix.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
+    const plen = @min(path.len, addr.path.len - 1);
+    @memcpy(addr.path[0..plen], path[0..plen]);
+    addr.path[plen] = 0;
+
+    posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch return false;
+    return true;
+}
 
 const session_dir = "/tmp/cmux-session";
 const session_file = "/tmp/cmux-session/layout.json";
@@ -214,8 +229,19 @@ pub fn restore(tab_manager: *TabManager) bool {
             c.gtk_box_remove(ws.container, child);
         }
 
-        // Add first pane with the saved dtach socket
-        const first_dtach: ?[]const u8 = if (dtach_paths[0].len > 0) dtach_paths[0] else null;
+        // Add first pane — reattach if dtach socket is alive, else fresh shell in saved CWD
+        const first_dtach: ?[]const u8 = if (dtach_paths[0].len > 0 and socketAlive(dtach_paths[0]))
+            dtach_paths[0]
+        else
+            null;
+        // Use saved CWD if starting fresh
+        var first_cwd_z: [256:0]u8 = undefined;
+        const first_cwd: ?[*:0]const u8 = if (first_dtach == null and cwd_paths[0].len > 0) blk: {
+            const cl = @min(cwd_paths[0].len, 255);
+            @memcpy(first_cwd_z[0..cl], cwd_paths[0][0..cl]);
+            first_cwd_z[cl] = 0;
+            break :blk first_cwd_z[0..cl :0];
+        } else null;
         const first_pane = Pane.init(tab_manager.allocator, ws.id, ws.socket_path) catch continue;
         first_pane.on_empty = Workspace.getOnPaneEmpty();
         first_pane.on_empty_ctx = ws;
@@ -230,11 +256,14 @@ pub fn restore(tab_manager: *TabManager) bool {
         c.gtk_widget_set_vexpand(pane_w, 1);
         c.gtk_widget_set_hexpand(pane_w, 1);
         c.gtk_box_append(ws.container, pane_w);
-        _ = first_pane.addTabDtach(null, first_dtach) catch continue;
+        _ = first_pane.addTabDtach(first_cwd, first_dtach) catch continue;
 
         // Additional panes: create splits with saved dtach sockets
         for (1..pane_count) |pi| {
-            const dtach: ?[]const u8 = if (dtach_paths[pi].len > 0) dtach_paths[pi] else null;
+            const dtach: ?[]const u8 = if (dtach_paths[pi].len > 0 and socketAlive(dtach_paths[pi]))
+                dtach_paths[pi]
+            else
+                null;
             ws.splitFocusedDtach(.vertical, dtach) catch continue;
         }
 
