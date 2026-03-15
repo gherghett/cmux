@@ -187,7 +187,17 @@ pub const SplitTree = struct {
     }
 
     /// Close the pane at `idx`, collapsing the parent split.
+    /// If kill_dtach is true, kills the dtach process (user-initiated close).
+    /// If false, dtach stays alive (cmux shutdown / session persistence).
     pub fn close(self: *SplitTree, idx: NodeIndex) void {
+        self.closeInner(idx, true);
+    }
+
+    pub fn closeSoft(self: *SplitTree, idx: NodeIndex) void {
+        self.closeInner(idx, false);
+    }
+
+    fn closeInner(self: *SplitTree, idx: NodeIndex, kill_dtach: bool) void {
         if (idx >= self.nodes.items.len) return;
         if (self.nodes.items[idx] != .leaf) return;
 
@@ -195,7 +205,7 @@ pub const SplitTree = struct {
 
         // If this is the only node (root leaf), just mark tree empty
         if (parent_idx == INVALID) {
-            self.nodes.items[idx].leaf.pane.deinit();
+            if (kill_dtach) self.nodes.items[idx].leaf.pane.close() else self.nodes.items[idx].leaf.pane.deinit();
             self.root = INVALID;
             self.focused = INVALID;
             return;
@@ -209,8 +219,8 @@ pub const SplitTree = struct {
         const grandparent_idx = self.parents.items[parent_idx];
         self.parents.items[sibling_idx] = grandparent_idx;
 
-        // Disconnect signals on the closed pane to prevent re-entrant cascade.
-        self.nodes.items[idx].leaf.pane.deinit();
+        // Clean up the closed pane. Kill dtach if user-initiated.
+        if (kill_dtach) self.nodes.items[idx].leaf.pane.close() else self.nodes.items[idx].leaf.pane.deinit();
 
         // Remove the CLOSED pane's widget from the old paned.
         // The sibling stays in place — no reparenting needed.

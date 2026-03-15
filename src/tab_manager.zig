@@ -70,11 +70,11 @@ pub const TabManager = struct {
     pub fn closeWorkspace(self: *TabManager, id: *const uuid.Uuid) void {
         for (self.workspaces.items, 0..) |ws, i| {
             if (uuid.eql(&ws.id, id)) {
-                // Disconnect all pane signals first to prevent child-exited cascade
+                // Kill dtach + disconnect signals for all panes (user-initiated close)
                 var pane_list = std.ArrayList(*Pane).init(self.allocator);
                 defer pane_list.deinit();
                 ws.allPanes(&pane_list) catch {};
-                for (pane_list.items) |pane| pane.deinit();
+                for (pane_list.items) |pane| pane.close();
 
                 // Remove from stack (GTK destroys the widget tree)
                 c.gtk_stack_remove(self.stack, ws.containerWidget());

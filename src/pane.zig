@@ -80,14 +80,31 @@ pub const Pane = struct {
         return pane;
     }
 
+    /// Disconnect signals only — dtach process stays alive for session persistence.
+    /// Used when cmux is closing (window close, shutdown).
     pub fn deinit(self: *Pane) void {
-        // Disconnect all signal handlers BEFORE destroying terminals
-        // to prevent child-exited callbacks into freed memory.
         for (self.tabs.items) |tab| {
             _ = c.g_signal_handlers_disconnect_matched(@as(c.gpointer, @ptrCast(@alignCast(tab.terminal))), c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @as(c.gpointer, @ptrCast(self)));
         }
         self.tabs.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Kill the dtach process and clean up the socket.
+    /// Used when the USER explicitly closes a pane or workspace.
+    pub fn killDtach(self: *Pane) void {
+        if (self.dtach_path_len > 0) {
+            const path = self.dtach_path[0..self.dtach_path_len];
+            log.info("killing dtach at {s}", .{path});
+            // Remove the socket file — dtach will get SIGPIPE and exit
+            std.fs.deleteFileAbsolute(path) catch {};
+        }
+    }
+
+    /// Full close: kill dtach + deinit. For explicit user actions.
+    pub fn close(self: *Pane) void {
+        self.killDtach();
+        self.deinit();
     }
 
     /// Add a new terminal tab. If dtach_socket is set, reattach to existing session.
