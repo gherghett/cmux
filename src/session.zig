@@ -1,4 +1,7 @@
 const std = @import("std");
+const cc = @import("c.zig");
+const c = cc.c;
+const asWidget = cc.asWidget;
 const uuid = @import("uuid.zig");
 const TabManager = @import("tab_manager.zig").TabManager;
 const Workspace = @import("workspace.zig").Workspace;
@@ -188,26 +191,51 @@ pub fn restore(tab_manager: *TabManager) bool {
             if (t.len > 0) ws.setTitle(t);
         }
 
-        // The workspace already has one pane from creation.
-        // Reattach first pane to its dtach socket.
-        if (ws.split_tree.focusedPane()) |first_pane| {
-            if (dtach_paths[0].len > 0) {
-                // Check if dtach socket still exists
-                std.fs.accessAbsolute(dtach_paths[0], .{}) catch {};
-                // If we got here without error, socket exists
-                first_pane.reattachDtach(dtach_paths[0]);
-            }
+        // The workspace already has one pane from creation — but it spawned
+        // a fresh dtach. We need to close it and respawn with the saved socket.
+        // Simpler: the workspace was created with addTab(null) which spawned a
+        // new dtach. We can't easily replace it. Instead, let's create workspaces
+        // WITHOUT the default pane and add panes with the right dtach socket.
+        //
+        // For now: the first pane is already spawned. Kill its VTE child and
+        // reattach. Actually, just close the workspace's default pane and
+        // recreate with the right dtach path.
+
+        // Close the auto-created pane
+        if (ws.split_tree.focusedPane()) |auto_pane| {
+            auto_pane.deinit();
+        }
+        // Reset the split tree
+        ws.split_tree = SplitTree.init(tab_manager.allocator);
+
+        // Remove all children from the container
+        const container_w = ws.containerWidget();
+        while (c.gtk_widget_get_first_child(container_w)) |child| {
+            c.gtk_box_remove(ws.container, child);
         }
 
-        // Additional panes: create splits
+        // Add first pane with the saved dtach socket
+        const first_dtach: ?[]const u8 = if (dtach_paths[0].len > 0) dtach_paths[0] else null;
+        const first_pane = Pane.init(tab_manager.allocator, ws.id, ws.socket_path) catch continue;
+        first_pane.on_empty = Workspace.getOnPaneEmpty();
+        first_pane.on_empty_ctx = ws;
+        first_pane.on_focus = Workspace.getOnPaneFocus();
+        first_pane.on_focus_ctx = ws;
+        first_pane.on_title = Workspace.getOnPaneTitle();
+        first_pane.on_title_ctx = ws;
+
+        ws.split_tree.setRoot(first_pane) catch continue;
+        first_pane.node_index = 0;
+        const pane_w = first_pane.widget();
+        c.gtk_widget_set_vexpand(pane_w, 1);
+        c.gtk_widget_set_hexpand(pane_w, 1);
+        c.gtk_box_append(ws.container, pane_w);
+        _ = first_pane.addTabDtach(null, first_dtach) catch continue;
+
+        // Additional panes: create splits with saved dtach sockets
         for (1..pane_count) |pi| {
-            ws.splitFocused(.vertical) catch continue;
-            if (ws.split_tree.focusedPane()) |new_pane| {
-                if (dtach_paths[pi].len > 0) {
-                    std.fs.accessAbsolute(dtach_paths[pi], .{}) catch continue;
-                    new_pane.reattachDtach(dtach_paths[pi]);
-                }
-            }
+            const dtach: ?[]const u8 = if (dtach_paths[pi].len > 0) dtach_paths[pi] else null;
+            ws.splitFocusedDtach(.vertical, dtach) catch continue;
         }
 
         restored += 1;

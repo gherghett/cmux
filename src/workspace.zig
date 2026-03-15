@@ -161,9 +161,12 @@ pub const Workspace = struct {
     }
 
     pub fn splitFocused(self: *Workspace, direction: SplitTree.Direction) !void {
+        return self.splitFocusedDtach(direction, null);
+    }
+
+    pub fn splitFocusedDtach(self: *Workspace, direction: SplitTree.Direction, dtach_socket: ?[]const u8) !void {
         if (self.split_tree.focused == SplitTree.INVALID) return;
 
-        // Inherit CWD from the focused terminal
         const cwd = if (self.split_tree.focusedPane()) |pane| pane.getCwd() else null;
 
         const new_pane = try Pane.init(self.allocator, self.id, self.socket_path);
@@ -177,7 +180,7 @@ pub const Workspace = struct {
         const new_idx = try self.split_tree.split(self.split_tree.focused, direction, new_pane);
         new_pane.node_index = new_idx;
         self.updateContainer();
-        _ = try new_pane.addTab(cwd);
+        _ = try new_pane.addTabDtach(cwd, dtach_socket);
     }
 
     pub fn closeFocused(self: *Workspace) void {
@@ -229,6 +232,10 @@ pub const Workspace = struct {
             c.g_object_unref(@ptrCast(@alignCast(root)));
         }
     }
+
+    pub fn getOnPaneEmpty() *const fn (*Pane, ?*anyopaque) void { return &onPaneEmpty; }
+    pub fn getOnPaneFocus() *const fn (*Pane, ?*anyopaque) void { return &onPaneFocus; }
+    pub fn getOnPaneTitle() *const fn ([*:0]const u8, ?*anyopaque) void { return &onPaneTitle; }
 
     fn onPaneTitle(title: [*:0]const u8, ctx: ?*anyopaque) void {
         const self: *Workspace = @ptrCast(@alignCast(ctx orelse return));

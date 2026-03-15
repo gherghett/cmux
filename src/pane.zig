@@ -90,8 +90,16 @@ pub const Pane = struct {
         self.allocator.destroy(self);
     }
 
-    /// Add a new terminal tab to this pane. Spawns a shell.
+    /// Add a new terminal tab. If dtach_socket is set, reattach to existing session.
+    pub fn addTabDtach(self: *Pane, cwd: ?[*:0]const u8, dtach_socket: ?[]const u8) !*Tab {
+        return self.addTabInner(cwd, dtach_socket);
+    }
+
     pub fn addTab(self: *Pane, cwd: ?[*:0]const u8) !*Tab {
+        return self.addTabInner(cwd, null);
+    }
+
+    fn addTabInner(self: *Pane, cwd: ?[*:0]const u8, dtach_socket: ?[]const u8) !*Tab {
         const tab_id = uuid.generate();
 
         const terminal: *c.VteTerminal = @ptrCast(@alignCast(
@@ -168,8 +176,8 @@ pub const Pane = struct {
         // URL matching: make URLs clickable
         setupUrlMatching(terminal, self);
 
-        // Spawn shell
-        self.spawnShell(terminal, cwd);
+        // Spawn shell (or reattach to existing dtach session)
+        self.spawnShellDtach(terminal, cwd, dtach_socket);
 
         // Make new tab visible and focused
         c.gtk_notebook_set_current_page(self.notebook, page_num);
