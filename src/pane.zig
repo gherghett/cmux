@@ -262,13 +262,12 @@ pub const Pane = struct {
         const surface_id = if (tab) |t| uuid.asSlice(&t.id) else "unknown";
         const workspace_id = uuid.asSlice(&self.workspace_id);
 
-        setEnvZ("CMUX_SURFACE_ID", surface_id);
-        setEnvZ("CMUX_WORKSPACE_ID", workspace_id);
-        setEnvZ("CMUX_PANEL_ID", surface_id);
-        setEnvZ("CMUX_TAB_ID", workspace_id);
-        setEnvZ("CMUX_SOCKET_PATH", self.socket_path);
-        _ = c.g_setenv("TERM_PROGRAM", "cmux", 1);
+        // Prepend bin to PATH once (process-level, safe to share)
         prependBinToPath();
+
+        // Build per-terminal env array with CMUX_* vars.
+        // Must NOT use g_setenv (process-global — last pane wins).
+        buildEnv(surface_id, workspace_id, self.socket_path);
 
         // Build dtach socket path
         var dtach_sock: [128]u8 = undefined;
@@ -304,7 +303,7 @@ pub const Pane = struct {
             c.VTE_PTY_DEFAULT,
             effective_cwd,
             @ptrCast(&argv),
-            null,
+            @ptrCast(&env_ptrs), // per-terminal env
             c.G_SPAWN_DEFAULT,
             null, null, null,
             -1,
@@ -350,18 +349,55 @@ pub const Pane = struct {
         _ = c.g_setenv("CMUX_SHELL_INTEGRATION_DIR", &init_dir_buf, 1);
     }
 
-    var setenv_buf: [8][512]u8 = undefined;
-    fn setEnvZ(name: [*:0]const u8, value: []const u8) void {
-        // setenv needs null-terminated value
-        const s = struct {
-            var idx: usize = 0;
+    // Per-terminal environment array. Static buffers so they live long enough
+    // for VTE's async spawn to read them.
+    var env_bufs: [16][512]u8 = undefined;
+    var env_ptrs: [256:null]?[*:0]const u8 = undefined;
+
+    fn buildEnv(surface_id: []const u8, workspace_id: []const u8, socket_path: []const u8) void {
+        var idx: usize = 0;
+        var buf_idx: usize = 0;
+
+        // Copy parent env, skipping CMUX_* and TERM_PROGRAM (we'll add ours)
+        const environ: ?[*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+        if (environ) |env| {
+            var i: usize = 0;
+            while (env[i]) |entry| : (i += 1) {
+                if (idx >= 240) break; // reserve space
+                const s = std.mem.span(entry);
+                // VTE requires every entry to contain '='
+                if (std.mem.indexOfScalar(u8, s, '=') == null) continue;
+                // Skip our vars (we'll re-add with correct per-terminal values)
+                if (std.mem.startsWith(u8, s, "CMUX_")) continue;
+                if (std.mem.startsWith(u8, s, "TERM_PROGRAM=")) continue;
+                env_ptrs[idx] = entry;
+                idx += 1;
+            }
+        }
+
+        // Add CMUX_* vars using static buffers
+        const vars = [_]struct { k: []const u8, v: []const u8 }{
+            .{ .k = "CMUX_SURFACE_ID=", .v = surface_id },
+            .{ .k = "CMUX_WORKSPACE_ID=", .v = workspace_id },
+            .{ .k = "CMUX_PANEL_ID=", .v = surface_id },
+            .{ .k = "CMUX_TAB_ID=", .v = workspace_id },
+            .{ .k = "CMUX_SOCKET_PATH=", .v = socket_path },
+            .{ .k = "TERM_PROGRAM=", .v = "cmux" },
         };
-        const bi = s.idx % 8;
-        s.idx += 1;
-        const vlen = @min(value.len, 511);
-        @memcpy(setenv_buf[bi][0..vlen], value[0..vlen]);
-        setenv_buf[bi][vlen] = 0;
-        _ = c.g_setenv(name, &setenv_buf[bi], 1);
+
+        for (vars) |kv| {
+            if (buf_idx >= env_bufs.len or idx >= 255) break;
+            const total = kv.k.len + kv.v.len;
+            if (total >= env_bufs[buf_idx].len) continue;
+            @memcpy(env_bufs[buf_idx][0..kv.k.len], kv.k);
+            @memcpy(env_bufs[buf_idx][kv.k.len..][0..kv.v.len], kv.v);
+            env_bufs[buf_idx][total] = 0;
+            env_ptrs[idx] = env_bufs[buf_idx][0..total :0];
+            idx += 1;
+            buf_idx += 1;
+        }
+
+        env_ptrs[idx] = null;
     }
 
     /// Close a tab by finding the VteTerminal in the notebook.
