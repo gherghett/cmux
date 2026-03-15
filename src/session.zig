@@ -107,9 +107,39 @@ fn writeJsonEscaped(w: anytype, s: []const u8) void {
 
 /// Restore workspaces from session file.
 /// Returns true if restoration was successful.
+/// Only restores if at least one dtach socket is alive.
+/// If all sockets are dead, deletes the stale session file.
 pub fn restore(tab_manager: *TabManager) bool {
     const file = std.fs.openFileAbsolute(session_file, .{}) catch return false;
     defer file.close();
+
+    // Quick check: are ANY dtach sockets alive?
+    var any_alive = false;
+    {
+        var check_buf: [32768]u8 = undefined;
+        const cn = file.read(&check_buf) catch return false;
+        const check_json = check_buf[0..cn];
+        const dtach_needle = "\"dtach\": \"";
+        var cpos: usize = 0;
+        while (std.mem.indexOfPos(u8, check_json, cpos, dtach_needle)) |dp| {
+            const ds = dp + dtach_needle.len;
+            const de = std.mem.indexOfScalarPos(u8, check_json, ds, '"') orelse break;
+            const path = check_json[ds..de];
+            if (path.len > 0 and socketAlive(path)) {
+                any_alive = true;
+                break;
+            }
+            cpos = de + 1;
+        }
+        // Seek back to start for actual parsing
+        file.seekTo(0) catch return false;
+    }
+
+    if (!any_alive) {
+        log.info("all dtach sockets dead, discarding stale session", .{});
+        std.fs.deleteFileAbsolute(session_file) catch {};
+        return false;
+    }
 
     var buf: [32768]u8 = undefined;
     const n = file.read(&buf) catch return false;
