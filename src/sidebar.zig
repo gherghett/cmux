@@ -23,6 +23,7 @@ pub const Sidebar = struct {
     tab_manager: *TabManager,
     last_ws_count: usize = 0,
     last_selected: usize = 0,
+    popover_open: bool = false,
 
     pub fn init(tab_manager: *TabManager) !Sidebar {
         const list_box: *c.GtkListBox = @ptrCast(@alignCast(c.gtk_list_box_new() orelse
@@ -68,13 +69,15 @@ pub const Sidebar = struct {
     fn onPeriodicRefresh(user_data: ?*anyopaque) callconv(.C) c.gboolean {
         const self: *Sidebar = @ptrCast(@alignCast(user_data orelse return 0));
 
-        // Update minimap snapshot for active workspace BEFORE rebuilding rows
+        // Update minimap snapshot for active workspace
         if (self.tab_manager.current()) |ws| {
             updateMinimapSnapshot(ws);
         }
 
-        // Always refresh rows (titles, CWDs, status change frequently)
-        self.refresh();
+        // Skip full rebuild if context menu is open
+        if (!self.popover_open) {
+            self.refresh();
+        }
 
         // Poll CDP for closed browser tabs
         var pane_list = std.ArrayList(*Pane).init(self.tab_manager.allocator);
@@ -332,7 +335,11 @@ pub const Sidebar = struct {
         ws_index: usize,
     };
 
-    fn onPopoverClosed(popover: *c.GtkPopover, _: ?*anyopaque) callconv(.C) void {
+    fn onPopoverClosed(popover: *c.GtkPopover, user_data: ?*anyopaque) callconv(.C) void {
+        if (user_data) |ud| {
+            const self: *Sidebar = @ptrCast(@alignCast(ud));
+            self.popover_open = false;
+        }
         c.gtk_widget_unparent(asWidget(popover));
     }
 
@@ -364,12 +371,13 @@ pub const Sidebar = struct {
         ));
         c.gtk_widget_set_parent(asWidget(popover), asWidget(row));
 
-        // Clean up popover when it closes (unparent to avoid GtkListBoxRow finalize warning)
+        // Track popover state to prevent sidebar refresh while menu is open
+        sidebar.popover_open = true;
         _ = c.g_signal_connect_data(
             @ptrCast(popover),
             "closed",
             @ptrCast(&onPopoverClosed),
-            null,
+            sidebar,
             null,
             0,
         );
