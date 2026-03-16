@@ -74,8 +74,8 @@ pub const Window = struct {
 
         c.adw_application_window_set_content(window, asWidget(toolbar_view));
 
-        // Create the first workspace
-        _ = try self.tab_manager.createWorkspace();
+        // No workspace created here — onActivate calls session.reconcile()
+        // which either restores workspaces or creates a fresh default.
 
         // Set up keyboard shortcuts
         self.setupShortcuts();
@@ -103,17 +103,16 @@ pub const Window = struct {
         return 0;
     }
 
+
     pub fn destroy(self: *Window) void {
         self.tab_manager.deinit();
         self.allocator.destroy(self);
     }
 
     pub fn show(self: *Window) void {
-        c.gtk_window_present(@ptrCast(@alignCast(self.window)));
-
-        if (self.tab_manager.current()) |ws| {
-            ws.focus();
-        }
+        // Just make visible — don't steal focus from the user's current window.
+        // The terminal gets focus when the user clicks into the cmux window.
+        c.gtk_widget_set_visible(@ptrCast(@alignCast(self.window)), 1);
     }
 
     fn setupShortcuts(self: *Window) void {

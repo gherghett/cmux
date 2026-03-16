@@ -7,7 +7,6 @@ zig-out/
 *.a
 
 # Test
-test_*.sh
 *.log
 
 # Local

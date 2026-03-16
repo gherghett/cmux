@@ -4,6 +4,7 @@ const c = cc.c;
 const asWidget = cc.asWidget;
 const uuid = @import("uuid.zig");
 
+const runtime_dir = @import("runtime_dir.zig");
 const log = std.log.scoped(.pane);
 
 /// A Pane wraps a GtkNotebook containing one or more VteTerminal tabs.
@@ -287,9 +288,9 @@ pub const Pane = struct {
             @memcpy(dtach_sock[0..dtach_sock_len], path[0..dtach_sock_len]);
             dtach_sock[dtach_sock_len] = 0;
         } else {
-            // Create new dtach session
+            // Create new dtach session in runtime dir
             const pane_id = uuid.asSlice(&self.id);
-            const dp = std.fmt.bufPrint(&dtach_sock, "/tmp/cmux-dtach-{s}.sock", .{pane_id}) catch return;
+            const dp = runtime_dir.dtachPath(&dtach_sock, pane_id);
             dtach_sock_len = dp.len;
             dtach_sock[dtach_sock_len] = 0;
         }
@@ -388,7 +389,7 @@ pub const Pane = struct {
             .{ .k = "CMUX_SURFACE_ID=", .v = surface_id },
             .{ .k = "CMUX_WORKSPACE_ID=", .v = workspace_id },
             .{ .k = "CMUX_PANEL_ID=", .v = surface_id },
-            .{ .k = "CMUX_TAB_ID=", .v = workspace_id },
+            .{ .k = "CMUX_TAB_ID=", .v = surface_id },
             .{ .k = "CMUX_SOCKET_PATH=", .v = socket_path },
             .{ .k = "TERM_PROGRAM=", .v = "cmux" },
         };
@@ -492,32 +493,92 @@ pub const Pane = struct {
         return &self.tabs.items[idx];
     }
 
-    /// Get the CWD of the current terminal's child process via /proc/pid/cwd.
-    /// Returns a null-terminated path in a static buffer, or null if unavailable.
+    /// Get the CWD of the innermost foreground process via /proc.
+    ///
+    /// With dtach, VTE doesn't own the shell process — dtach daemonizes and
+    /// VTE's child exits immediately after attaching. So TIOCGPGRP on VTE's
+    /// PTY doesn't help. Instead we find the dtach master process by scanning
+    /// /proc for our stored socket path, then walk its children to find the
+    /// deepest (foreground) process.
     pub fn getCwd(self: *Pane) ?[*:0]const u8 {
-        const term = self.currentTerminal() orelse return null;
-        // VTE provides the child PID through the pty
-        const pty = c.vte_terminal_get_pty(term) orelse return null;
-        const fd = c.vte_pty_get_fd(pty);
-        if (fd < 0) return null;
+        if (self.dtach_path_len == 0) return null;
+        const dtach_path = self.dtach_path[0..self.dtach_path_len];
 
-        // Get the child PID via the PTY's foreground process group
-        // Simpler: use /proc/self/fd/<fd> to find the pty, then pgrp
-        // Actually, just use vte_terminal_get_child_pid if available,
-        // or read /proc/<pid>/cwd. VTE doesn't expose child PID directly
-        // in all versions, so let's use the pty fd approach.
+        // Find the dtach master process that owns our socket
+        const dtach_pid = findDtachPidBySocket(dtach_path) orelse return null;
 
-        // Alternative: get the foreground process from the pty
-        var pgrp: std.c.pid_t = undefined;
-        const ret = std.c.ioctl(fd, std.os.linux.T.IOCGPGRP, @intFromPtr(&pgrp));
-        if (ret != 0 or pgrp <= 0) return null;
+        // Walk its children to find the deepest (foreground command)
+        const leaf_pid = findDeepestChild(dtach_pid);
 
-        // Read /proc/<pgrp>/cwd
+        return readProcCwd(leaf_pid);
+    }
+
+    /// Find the dtach master process PID by scanning /proc for a process
+    /// whose cmdline contains our dtach socket path.
+    fn findDtachPidBySocket(socket_path: []const u8) ?std.c.pid_t {
+        var dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return null;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            // Only look at numeric directory names (PIDs)
+            const pid = std.fmt.parseInt(std.c.pid_t, entry.name, 10) catch continue;
+            if (pid <= 0) continue;
+
+            // Read /proc/<pid>/cmdline
+            var cmdline_path_buf: [32]u8 = undefined;
+            const cmdline_path = std.fmt.bufPrint(&cmdline_path_buf, "/proc/{d}/cmdline", .{pid}) catch continue;
+
+            const file = std.fs.openFileAbsolute(cmdline_path, .{}) catch continue;
+            defer file.close();
+
+            var cmdline_buf: [512]u8 = undefined;
+            const n = file.read(&cmdline_buf) catch continue;
+            if (n == 0) continue;
+
+            // cmdline is null-separated. Check if it contains "dtach" and our socket path.
+            const cmdline = cmdline_buf[0..n];
+            if (std.mem.indexOf(u8, cmdline, "dtach") == null) continue;
+            if (std.mem.indexOf(u8, cmdline, socket_path) != null) {
+                return pid;
+            }
+        }
+        return null;
+    }
+
+    /// Walk /proc/<pid>/task/<pid>/children repeatedly to find the leaf process.
+    fn findDeepestChild(start_pid: std.c.pid_t) std.c.pid_t {
+        var pid = start_pid;
+        var depth: u8 = 0;
+        while (depth < 8) : (depth += 1) {
+            var children_path_buf: [64]u8 = undefined;
+            const children_path = std.fmt.bufPrint(
+                &children_path_buf,
+                "/proc/{d}/task/{d}/children",
+                .{ pid, pid },
+            ) catch break;
+
+            const file = std.fs.openFileAbsolute(children_path, .{}) catch break;
+            defer file.close();
+
+            var buf: [256]u8 = undefined;
+            const n = file.read(&buf) catch break;
+            if (n == 0) break; // no children — this is the leaf
+
+            // Parse first child PID (space-separated)
+            const content = std.mem.trim(u8, buf[0..n], " \n");
+            const first_space = std.mem.indexOfScalar(u8, content, ' ') orelse content.len;
+            const child_pid = std.fmt.parseInt(std.c.pid_t, content[0..first_space], 10) catch break;
+            if (child_pid <= 0) break;
+
+            pid = child_pid;
+        }
+        return pid;
+    }
+
+    fn readProcCwd(pid: std.c.pid_t) ?[*:0]const u8 {
         var proc_path_buf: [64]u8 = undefined;
-        const proc_path = std.fmt.bufPrint(&proc_path_buf, "/proc/{d}/cwd", .{pgrp}) catch return null;
-        var proc_z: [65]u8 = undefined;
-        @memcpy(proc_z[0..proc_path.len], proc_path);
-        proc_z[proc_path.len] = 0;
+        const proc_path = std.fmt.bufPrint(&proc_path_buf, "/proc/{d}/cwd", .{pid}) catch return null;
 
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
         const link = std.fs.readLinkAbsolute(proc_path, &link_buf) catch return null;

@@ -44,6 +44,18 @@ pub const TabManager = struct {
     /// Create a new workspace and select it.
     pub fn createWorkspace(self: *TabManager) !*Workspace {
         const ws = try Workspace.init(self.allocator, self.socket_path);
+        try self.addWorkspaceToStack(ws);
+        return ws;
+    }
+
+    /// Create a workspace with a specific UUID and no initial pane (for session restore).
+    pub fn createWorkspaceWithId(self: *TabManager, id: uuid.Uuid) !*Workspace {
+        const ws = try Workspace.initEmpty(self.allocator, self.socket_path, id);
+        try self.addWorkspaceToStack(ws);
+        return ws;
+    }
+
+    fn addWorkspaceToStack(self: *TabManager, ws: *Workspace) !void {
         try self.workspaces.append(ws);
 
         // Add workspace container to the GtkStack
@@ -62,8 +74,6 @@ pub const TabManager = struct {
             uuid.asSlice(&ws.id),
             self.workspaces.items.len,
         });
-
-        return ws;
     }
 
     /// Close a workspace by ID.
@@ -72,15 +82,17 @@ pub const TabManager = struct {
             if (uuid.eql(&ws.id, id)) {
                 // Mark as closing to suppress auto-respawn
                 ws.closing = true;
-                // Kill dtach + disconnect signals for all panes
+                // Kill dtach for all panes (explicit user close)
                 var pane_list = std.ArrayList(*Pane).init(self.allocator);
                 defer pane_list.deinit();
                 ws.allPanes(&pane_list) catch {};
-                for (pane_list.items) |pane| pane.close();
+                for (pane_list.items) |pane| pane.killDtach();
 
                 // Remove from stack (GTK destroys the widget tree)
                 c.gtk_stack_remove(self.stack, ws.containerWidget());
-                self.allocator.destroy(ws);
+
+                // Free workspace + split tree + pane structs (dtach already killed above)
+                ws.deinit();
                 _ = self.workspaces.orderedRemove(i);
 
                 // Adjust selection

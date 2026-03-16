@@ -83,11 +83,17 @@ pub const SocketServer = struct {
     }
 
     pub fn destroy(self: *SocketServer) void {
+        // Remove GLib sources. Use g_source_remove only if the source
+        // is still active — GIOChannel sources may have been auto-removed
+        // during GTK shutdown when channels were invalidated.
         if (self.source_id) |sid| {
-            _ = c.g_source_remove(sid);
+            const src = c.g_main_context_find_source_by_id(c.g_main_context_default(), sid);
+            if (src != null) _ = c.g_source_remove(sid);
+            self.source_id = null;
         }
         for (self.client_sources.items) |sid| {
-            _ = c.g_source_remove(sid);
+            const src = c.g_main_context_find_source_by_id(c.g_main_context_default(), sid);
+            if (src != null) _ = c.g_source_remove(sid);
         }
         self.client_sources.deinit();
         posix.close(self.fd);
@@ -494,9 +500,11 @@ pub const SocketServer = struct {
         var value_buf: [128]u8 = undefined;
         var value_len: usize = 0;
         var target_ws: ?*Workspace = null;
+        var tab_specified = false;
 
         while (iter.next()) |part| {
             if (std.mem.startsWith(u8, part, "--tab=")) {
+                tab_specified = true;
                 // Find workspace by ID
                 const ws_id_str = part[6..];
                 if (ws_id_str.len >= 36) {
@@ -515,6 +523,9 @@ pub const SocketServer = struct {
             }
         }
 
+        // If --tab= was specified but workspace not found, don't silently
+        // fall through to current workspace (causes wrong-tab routing).
+        if (tab_specified and target_ws == null) return "ERROR: workspace not found";
         const ws = target_ws orelse self.tab_manager.current() orelse return "ERROR: no workspace";
         const value = value_buf[0..value_len];
 
@@ -546,8 +557,10 @@ pub const SocketServer = struct {
         if (key.len == 0) return "ERROR: missing key";
 
         var target_ws: ?*Workspace = null;
+        var tab_specified = false;
         while (iter.next()) |part| {
             if (std.mem.startsWith(u8, part, "--tab=")) {
+                tab_specified = true;
                 const ws_id_str = part[6..];
                 if (ws_id_str.len >= 36) {
                     var ws_id: uuid.Uuid = undefined;
@@ -557,6 +570,7 @@ pub const SocketServer = struct {
             }
         }
 
+        if (tab_specified and target_ws == null) return "ERROR: workspace not found";
         const ws = target_ws orelse self.tab_manager.current() orelse return "ERROR: no workspace";
 
         if (std.mem.eql(u8, key, "claude_code")) {

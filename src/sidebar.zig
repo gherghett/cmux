@@ -51,6 +51,10 @@ pub const Sidebar = struct {
 
     /// Ensure each workspace has a row. Add missing rows, update all.
     pub fn sync(self: *Sidebar) void {
+        // Skip if shutting down — widgets may already be destroyed by GTK
+        if (self.tab_manager.workspaces.items.len > 0 and
+            self.tab_manager.workspaces.items[0].closing) return;
+
         // Add rows for new workspaces (that don't have sidebar widgets yet)
         for (self.tab_manager.workspaces.items) |ws| {
             if (ws.sidebar == null) {
@@ -231,8 +235,11 @@ pub const Sidebar = struct {
     fn onPeriodicRefresh(user_data: ?*anyopaque) callconv(.C) c.gboolean {
         const self: *Sidebar = @ptrCast(@alignCast(user_data orelse return 0));
 
-        // Stop if GTK is shutting down
+        // Stop if GTK is shutting down — check if any workspace is closing
+        // (set before GTK teardown), or if there are no workspaces at all.
         if (c.g_application_get_default() == null) return 0;
+        if (self.tab_manager.workspaces.items.len == 0) return 0;
+        if (self.tab_manager.workspaces.items[0].closing) return 0;
 
         // Update all rows in-place (minimaps redraw via queue_draw)
         self.updateAll();
@@ -349,6 +356,7 @@ pub const Sidebar = struct {
         if (count.* >= 16) return;
 
         switch (tree.nodes.items[idx]) {
+            .dead => {},
             .leaf => |leaf| {
                 out[count.*] = .{ .pane = leaf.pane, .x = x, .y = y, .w = w, .h = h };
                 count.* += 1;

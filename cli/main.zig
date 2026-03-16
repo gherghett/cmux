@@ -1,7 +1,20 @@
 const std = @import("std");
 const posix = std.posix;
 
-const default_socket_path = "/tmp/cmux.sock";
+/// Resolve the default socket path using the same logic as the server.
+/// Priority: $CMUX_SOCKET_PATH > $XDG_RUNTIME_DIR/cmux/cmux.sock > /tmp/cmux-<uid>/cmux.sock
+var resolved_socket_buf: [256]u8 = undefined;
+fn defaultSocketPath() []const u8 {
+    if (posix.getenv("XDG_RUNTIME_DIR")) |xdg| {
+        const len = (std.fmt.bufPrint(&resolved_socket_buf, "{s}/cmux/cmux.sock", .{xdg}) catch
+            return "/tmp/cmux.sock").len;
+        return resolved_socket_buf[0..len];
+    }
+    const uid = std.os.linux.getuid();
+    const len = (std.fmt.bufPrint(&resolved_socket_buf, "/tmp/cmux-{d}/cmux.sock", .{uid}) catch
+        return "/tmp/cmux.sock").len;
+    return resolved_socket_buf[0..len];
+}
 
 pub fn main() !void {
     const args = std.os.argv;
@@ -48,7 +61,7 @@ pub fn main() !void {
 }
 
 fn sendCommand(cmd: []const u8) ![]const u8 {
-    const socket_path = std.posix.getenv("CMUX_SOCKET_PATH") orelse default_socket_path;
+    const socket_path = std.posix.getenv("CMUX_SOCKET_PATH") orelse defaultSocketPath();
 
     const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(fd);
@@ -93,8 +106,12 @@ fn handleClaudeHook(args: [][*:0]u8) void {
     const stdin_len = std.io.getStdIn().read(&stdin_buf) catch 0;
     const stdin_data = stdin_buf[0..stdin_len];
 
-    // Log to file (hook stderr is suppressed by 2>/dev/null)
-    if (std.fs.createFileAbsolute("/tmp/cmux-hooks.log", .{ .truncate = false })) |file| {
+    // Log to file (hook stderr is suppressed by 2>/dev/null).
+    // Write to runtime dir (same as server) so logs are in one place.
+    var hooks_log_buf: [256]u8 = undefined;
+    const hooks_log_dir = if (posix.getenv("XDG_RUNTIME_DIR")) |xdg| xdg else "/tmp";
+    const hooks_log_path = std.fmt.bufPrint(&hooks_log_buf, "{s}/cmux/hooks.log", .{hooks_log_dir}) catch "/tmp/cmux-hooks.log";
+    if (std.fs.createFileAbsolute(hooks_log_path, .{ .truncate = false })) |file| {
         defer file.close();
         file.seekFromEnd(0) catch {};
         const w = file.writer();

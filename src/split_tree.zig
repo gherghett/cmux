@@ -34,6 +34,7 @@ pub const SplitTree = struct {
     pub const Node = union(enum) {
         leaf: LeafNode,
         split: SplitNode,
+        dead: void, // freed node — pane memory released, skip during iteration
     };
 
     pub const LeafNode = struct {
@@ -70,7 +71,7 @@ pub const SplitTree = struct {
         for (self.nodes.items) |node| {
             switch (node) {
                 .leaf => |leaf| leaf.pane.deinit(),
-                .split => {},
+                .split, .dead => {},
             }
         }
         self.nodes.deinit();
@@ -209,6 +210,7 @@ pub const SplitTree = struct {
         // If this is the only node (root leaf), just mark tree empty
         if (parent_idx == INVALID) {
             if (kill_dtach) self.nodes.items[idx].leaf.pane.close() else self.nodes.items[idx].leaf.pane.deinit();
+            self.nodes.items[idx] = .dead;
             self.root = INVALID;
             self.focused = INVALID;
             return;
@@ -228,6 +230,7 @@ pub const SplitTree = struct {
 
         // Clean up the closed pane. Kill dtach if user-initiated.
         if (kill_dtach) self.nodes.items[idx].leaf.pane.close() else self.nodes.items[idx].leaf.pane.deinit();
+        self.nodes.items[idx] = .dead; // mark freed — prevents use-after-free in deferred callbacks
         if (c.gtk_paned_get_start_child(old_paned) == closed_widget) {
             c.gtk_paned_set_start_child(old_paned, null);
         } else {
@@ -269,7 +272,7 @@ pub const SplitTree = struct {
         if (self.focused >= self.nodes.items.len) return null;
         return switch (self.nodes.items[self.focused]) {
             .leaf => |leaf| leaf.pane,
-            .split => null,
+            .split, .dead => null,
         };
     }
 
@@ -314,6 +317,7 @@ pub const SplitTree = struct {
                 try self.collectPanes(s.first, out);
                 try self.collectPanes(s.second, out);
             },
+            .dead => {},
         }
     }
 
@@ -330,6 +334,49 @@ pub const SplitTree = struct {
             return 0; // done
         }
         return 1; // try again next idle
+    }
+
+    // --- Tree construction helpers (for session restore) ---
+
+    /// Add a leaf node directly. Returns its index.
+    pub fn addLeaf(self: *SplitTree, pane: *Pane, parent: NodeIndex) !NodeIndex {
+        return self.addNode(.{ .leaf = .{ .pane = pane } }, parent);
+    }
+
+    /// Add a split node directly, linking two existing children. Returns its index.
+    pub fn addSplit(
+        self: *SplitTree,
+        direction: Direction,
+        paned: *c.GtkPaned,
+        first: NodeIndex,
+        second: NodeIndex,
+        parent: NodeIndex,
+    ) !NodeIndex {
+        const idx = try self.addNode(.{ .split = .{
+            .direction = direction,
+            .paned = paned,
+            .first = first,
+            .second = second,
+        } }, parent);
+        self.parents.items[first] = idx;
+        self.parents.items[second] = idx;
+        return idx;
+    }
+
+    /// Get the widget for a node by index.
+    pub fn getNodeWidget(self: *SplitTree, idx: NodeIndex) *c.GtkWidget {
+        return self.nodeWidget(idx);
+    }
+
+    /// Request a 50/50 split position once the paned is laid out.
+    pub fn requestEqualSplit(paned: *c.GtkPaned) void {
+        _ = c.g_idle_add(@ptrCast(&onSetEqualSplit), paned);
+    }
+
+    /// Get the first leaf starting from the root (for session restore focus).
+    pub fn firstLeafFromRoot(self: *SplitTree) NodeIndex {
+        if (self.root == INVALID) return INVALID;
+        return self.firstLeaf(self.root);
     }
 
     // --- Internal helpers ---
@@ -365,6 +412,7 @@ pub const SplitTree = struct {
         return switch (self.nodes.items[idx]) {
             .leaf => |leaf| leaf.pane.widget(),
             .split => |s| asWidget(s.paned),
+            .dead => unreachable, // dead nodes should never be accessed for widgets
         };
     }
 
@@ -374,6 +422,7 @@ pub const SplitTree = struct {
             switch (self.nodes.items[current]) {
                 .leaf => return current,
                 .split => |s| current = s.first,
+                .dead => return INVALID,
             }
         }
     }

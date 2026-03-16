@@ -23,6 +23,7 @@ zig build
 - **VTE** (libvte-2.91-gtk4) for terminal rendering
 - **GTK4 + libadwaita** for UI
 - **Zig** as language and build system
+- **dtach** for terminal session persistence across cmux restarts
 - **libnotify** for desktop notifications
 - **CDP** (Chrome DevTools Protocol) for browser tab tracking (optional, requires Brave with `--remote-debugging-port=9222`)
 
@@ -30,13 +31,15 @@ zig build
 
 ```
 src/
-  main.zig           — App entry, GTK Application lifecycle
+  main.zig           — App entry, GTK lifecycle, logging, shutdown
   window.zig         — AdwApplicationWindow, sidebar + content layout, keyboard shortcuts
   tab_manager.zig    — Workspace list, selection, CRUD
-  workspace.zig      — Workspace model, Claude status, split operations
-  split_tree.zig     — Binary split tree with GtkPaned
-  pane.zig           — GtkNotebook + VteTerminal tabs, URL click handling, CDP tracking
+  workspace.zig      — Workspace model, Claude status, split operations, pane lifecycle
+  split_tree.zig     — Binary split tree with GtkPaned, .dead node marker
+  pane.zig           — GtkNotebook + VteTerminal tabs, dtach spawn/kill, URL click, CDP
   sidebar.zig        — Rich 3-row workspace tabs with Claude status indicators
+  session.zig        — Session save/restore, startup reconciliation, dangling dtach cleanup
+  runtime_dir.zig    — Centralized runtime directory ($XDG_RUNTIME_DIR/cmux or /tmp/cmux-<uid>)
   socket.zig         — Unix socket IPC server, v1 protocol
   notification.zig   — Desktop notifications via libnotify
   uuid.zig           — UUID v4 generator
@@ -46,7 +49,49 @@ cli/
 bin/
   claude             — Claude Code wrapper (injects hooks)
   cmux-shell-init.sh — Shell integration (bashrc source)
+tests/
+  run_all.sh         — Test runner: ./tests/run_all.sh [name...]
+  lib.sh             — Shared test helpers (start/stop cmux, check, cleanup)
+  test_basics.sh     — Socket, workspaces, splits, send, claude status, notifications
+  test_session.sh    — Session save/restore, double-restart, split direction persistence
+  test_lifecycle.sh  — Dangling dtach cleanup, env vars, UUID preservation, clean shutdown
 ```
+
+## Runtime directory
+
+All sockets, session files, and logs live in a single directory:
+- `$XDG_RUNTIME_DIR/cmux/` (typically `/run/user/1000/cmux/`)
+- Fallback: `/tmp/cmux-<uid>/`
+
+Files within:
+- `cmux.sock` — IPC socket for CLI
+- `session.json` — workspace layout + dtach paths
+- `cmux.log` — persistent log (512KB rotation)
+- `dtach-<uuid>.sock` — one per terminal pane
+
+## Startup lifecycle
+
+```
+main() → onActivate
+  ├─ Window.create()          — GTK window shell, no workspace yet
+  ├─ session.reconcile()      — single entry point:
+  │    ├─ scan runtime dir for dtach-*.sock files
+  │    ├─ read session.json
+  │    ├─ kill untracked dtach (danglers)
+  │    ├─ delete dead socket files
+  │    ├─ restore workspaces (reattach alive, fresh for dead)
+  │    └─ OR create default workspace if no session
+  ├─ SocketServer.create()
+  └─ win.show()
+```
+
+## Shutdown lifecycle
+
+All shutdown paths (window close, SIGTERM, SIGINT) converge:
+- Save session while VTE terminals are alive
+- Mark all workspaces as closing (suppresses pane respawn)
+- Destroy socket server
+- dtach processes survive intentionally (session persistence)
 
 ## Keyboard shortcuts
 
@@ -64,7 +109,7 @@ bin/
 
 ## Socket protocol (v1)
 
-Line-delimited text on `/tmp/cmux.sock`:
+Line-delimited text on `$XDG_RUNTIME_DIR/cmux/cmux.sock`:
 ```
 ping → PONG
 list_workspaces → id\ttitle per line
@@ -75,8 +120,8 @@ close_workspace <id> → OK
 rename_workspace <id> <title> → OK
 new_split <h|v> → OK
 send <text> → OK (supports \n \t \r \\)
-set_status <key> <value> [--tab=id] → OK
-clear_status <key> [--tab=id] → OK
+set_status <key> <value> [--tab=id] → OK | ERROR: workspace not found
+clear_status <key> [--tab=id] → OK | ERROR: workspace not found
 notify <title>|<body> [--tab=id] → OK
 ```
 
@@ -87,12 +132,19 @@ Hooks in `~/.claude/settings.json` fire `cmux-cli claude-hook <event>`:
 - `Stop` → ● Unread + last assistant message
 - `Notification` → ● Unread/Attention + message preview
 
+Status routes to workspace via `--tab=<workspace-uuid>`. Unknown UUIDs return an error (no silent fallback).
+
 ## Testing
 
 ```bash
-# Automated test with virtual display
-xvfb-run --auto-servernum -- ./zig-out/bin/cmux &
-./zig-out/bin/cmux-cli ping
-./zig-out/bin/cmux-cli new_split h
-./zig-out/bin/cmux-cli list_workspaces
+# Run all tests
+./tests/run_all.sh
+
+# Run specific suite
+./tests/run_all.sh basics
+./tests/run_all.sh session
+./tests/run_all.sh lifecycle
+
+# Detailed log
+cat tests/test.log
 ```

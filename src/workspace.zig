@@ -22,6 +22,7 @@ pub const Workspace = struct {
     socket_path: []const u8,
     minimap_dirty: bool = true,
     closing: bool = false, // suppress auto-respawn during close/shutdown
+    handling_pane_close: bool = false, // re-entrancy guard for onPaneEmpty
     sidebar: ?SidebarWidgets = null,
 
     /// Claude Code status for sidebar indicator.
@@ -65,6 +66,34 @@ pub const Workspace = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, socket_path: []const u8) !*Workspace {
+        const ws = try initEmpty(allocator, socket_path, uuid.generate());
+
+        // Create initial pane with one terminal tab
+        const pane = try Pane.init(allocator, ws.id, socket_path);
+        pane.on_empty = &onPaneEmpty;
+        pane.on_empty_ctx = ws;
+
+        try ws.split_tree.setRoot(pane);
+        pane.node_index = 0; // root node
+        pane.on_focus = &onPaneFocus;
+        pane.on_focus_ctx = ws;
+        pane.on_title = &onPaneTitle;
+        pane.on_title_ctx = ws;
+        const pane_w = pane.widget();
+        c.gtk_widget_set_vexpand(pane_w, 1);
+        c.gtk_widget_set_hexpand(pane_w, 1);
+        c.gtk_box_append(ws.container, pane_w);
+
+        _ = try pane.addTab(null);
+        pane.waitReady();
+
+        log.info("created workspace {s}", .{uuid.asSlice(&ws.id)});
+        return ws;
+    }
+
+    /// Create workspace with a specific UUID and no initial pane.
+    /// Used during session restore to preserve workspace identities.
+    pub fn initEmpty(allocator: std.mem.Allocator, socket_path: []const u8, id: uuid.Uuid) !*Workspace {
         const ws = try allocator.create(Workspace);
         errdefer allocator.destroy(ws);
 
@@ -73,7 +102,6 @@ pub const Workspace = struct {
                 return error.GtkWidgetCreateFailed,
         ));
 
-        const id = uuid.generate();
         const default_title = "Terminal";
 
         var title_buf: [256]u8 = undefined;
@@ -92,26 +120,6 @@ pub const Workspace = struct {
             .socket_path = socket_path,
         };
 
-        // Create initial pane with one terminal tab
-        const pane = try Pane.init(allocator, id, socket_path);
-        pane.on_empty = &onPaneEmpty;
-        pane.on_empty_ctx = ws;
-
-        try ws.split_tree.setRoot(pane);
-        pane.node_index = 0; // root node
-        pane.on_focus = &onPaneFocus;
-        pane.on_focus_ctx = ws;
-        pane.on_title = &onPaneTitle;
-        pane.on_title_ctx = ws;
-        const pane_w = pane.widget();
-        c.gtk_widget_set_vexpand(pane_w, 1);
-        c.gtk_widget_set_hexpand(pane_w, 1);
-        c.gtk_box_append(box, pane_w);
-
-        _ = try pane.addTab(null);
-        pane.waitReady();
-
-        log.info("created workspace {s}", .{uuid.asSlice(&id)});
         return ws;
     }
 
@@ -271,17 +279,34 @@ pub const Workspace = struct {
     fn onPaneEmpty(pane: *Pane, ctx: ?*anyopaque) void {
         const self: *Workspace = @ptrCast(@alignCast(ctx orelse return));
 
+        // During window close / workspace teardown, GTK destroys VTE widgets
+        // which fires child-exited for every pane. Skip tree updates entirely —
+        // the workspace is about to be freed.
+        if (self.closing) return;
+
+        // Guard against re-entrancy: if pane A's close triggers pane B's
+        // child-exited (e.g. shared dtach, or GTK signal batching), the
+        // second onPaneEmpty would corrupt the tree mid-close.
+        // Defer to an idle callback instead.
+        if (self.handling_pane_close) {
+            log.info("deferring pane close (re-entrant)", .{});
+            _ = c.g_idle_add(@ptrCast(&onDeferredPaneCleanup), self);
+            return;
+        }
+
         // Find this pane in the split tree and close it
         for (self.split_tree.nodes.items, 0..) |node, i| {
             switch (node) {
                 .leaf => |leaf| {
                     if (leaf.pane == pane) {
                         log.info("closing empty pane idx={}", .{i});
+                        self.handling_pane_close = true;
                         self.split_tree.close(@intCast(i));
                         self.updateContainer();
+                        self.handling_pane_close = false;
 
-                        // If tree is now empty, create a fresh pane (unless shutting down)
-                        if (self.split_tree.root == SplitTree.INVALID and !self.closing) {
+                        // If tree is now empty, create a fresh pane
+                        if (self.split_tree.root == SplitTree.INVALID) {
                             self.createInitialPane() catch {
                                 log.err("failed to create replacement pane", .{});
                             };
@@ -289,9 +314,41 @@ pub const Workspace = struct {
                         return;
                     }
                 },
-                .split => {},
+                .split, .dead => {},
             }
         }
+    }
+
+    /// Deferred cleanup for panes that exited during a re-entrant onPaneEmpty.
+    /// Runs on the next GTK idle iteration after the first close completes.
+    fn onDeferredPaneCleanup(user_data: ?*anyopaque) callconv(.C) c.gboolean {
+        const self: *Workspace = @ptrCast(@alignCast(user_data orelse return 0));
+        if (self.closing) return 0;
+
+        // Find any leaf pane with zero tabs (dead but not yet removed from tree).
+        // Skip .dead nodes — those have already been freed.
+        for (self.split_tree.nodes.items, 0..) |node, i| {
+            switch (node) {
+                .leaf => |leaf| {
+                    if (leaf.pane.tabs.items.len == 0) {
+                        log.info("deferred close of empty pane idx={}", .{i});
+                        self.split_tree.close(@intCast(i));
+                        self.updateContainer();
+
+                        if (self.split_tree.root == SplitTree.INVALID) {
+                            self.createInitialPane() catch {
+                                log.err("failed to create replacement pane", .{});
+                            };
+                        }
+                        // Only handle one per idle tick to avoid index invalidation.
+                        // Return 1 to run again if there are more.
+                        return 1;
+                    }
+                },
+                .split, .dead => {},
+            }
+        }
+        return 0; // no more dead panes, done
     }
 
     fn createInitialPane(self: *Workspace) !void {
