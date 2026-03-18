@@ -46,6 +46,12 @@ pub const Pane = struct {
     cached_leaf_pid: std.c.pid_t = 0,
     cached_leaf_time: i64 = 0,
 
+    /// Ring buffer of recent distinct processes reported via shell integration.
+    proc_history: [16][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 16,
+    proc_history_lens: [16]u8 = [_]u8{0} ** 16,
+    proc_history_idx: u8 = 0,
+    proc_history_count: u8 = 0,
+
     pub const Tab = struct {
         id: uuid.Uuid,
         terminal: *c.VteTerminal,
@@ -305,12 +311,16 @@ pub const Pane = struct {
         @memcpy(self.dtach_path[0..dtach_sock_len], dtach_sock[0..dtach_sock_len]);
         self.dtach_path_len = dtach_sock_len;
 
-        // Build command: dtach -A <socket> -Ez <shell>
+        // Build command: dtach -A <socket> -Ez bash --rcfile <cmux-bash>
+        // --rcfile makes bash source our wrapper (which sources .bashrc + cmux shell init)
         // -E disables detach char, -z disables suspend
         const sock_path_z: [*:0]const u8 = dtach_sock[0..dtach_sock_len :0];
         const shell_z: [*:0]const u8 = &shell_path_buf;
-        var argv = [_:null]?[*:0]const u8{
-            "dtach", "-A", sock_path_z, "-Ez", shell_z, null,
+        const rcfile_z: [*:0]const u8 = getRcfilePath();
+        var argv = if (rcfile_z[0] != 0) [_:null]?[*:0]const u8{
+            "dtach", "-A", sock_path_z, "-Ez", shell_z, "--rcfile", rcfile_z, null,
+        } else [_:null]?[*:0]const u8{
+            "dtach", "-A", sock_path_z, "-Ez", shell_z, null, null, null,
         };
 
         c.vte_terminal_spawn_async(
@@ -326,6 +336,30 @@ pub const Pane = struct {
             @ptrCast(&onSpawnComplete),
             self,
         );
+    }
+
+    var rcfile_buf: [512:0]u8 = undefined;
+    var rcfile_initialized: bool = false;
+
+    fn getRcfilePath() [*:0]const u8 {
+        if (!rcfile_initialized) {
+            rcfile_initialized = true;
+            // Find cmux-bash next to our executable
+            var exe_buf: [4096]u8 = undefined;
+            const exe_path = std.fs.readLinkAbsolute("/proc/self/exe", &exe_buf) catch {
+                rcfile_buf[0] = 0;
+                return &rcfile_buf;
+            };
+            const d1 = std.fs.path.dirname(exe_path) orelse { rcfile_buf[0] = 0; return &rcfile_buf; };
+            const d2 = std.fs.path.dirname(d1) orelse { rcfile_buf[0] = 0; return &rcfile_buf; };
+            const dir = std.fs.path.dirname(d2) orelse { rcfile_buf[0] = 0; return &rcfile_buf; };
+            const result = std.fmt.bufPrint(&rcfile_buf, "{s}/bin/cmux-bash", .{dir}) catch {
+                rcfile_buf[0] = 0;
+                return &rcfile_buf;
+            };
+            rcfile_buf[result.len] = 0;
+        }
+        return &rcfile_buf;
     }
 
     var path_prepended: bool = false;
@@ -390,7 +424,8 @@ pub const Pane = struct {
             }
         }
 
-        // Add CMUX_* vars using static buffers
+        // Add CMUX_* vars using static buffers.
+        // CMUX_SHELL_INIT triggers auto-sourcing of shell integration on first prompt.
         const vars = [_]struct { k: []const u8, v: []const u8 }{
             .{ .k = "CMUX_SURFACE_ID=", .v = surface_id },
             .{ .k = "CMUX_WORKSPACE_ID=", .v = workspace_id },
@@ -483,6 +518,7 @@ pub const Pane = struct {
 
     /// Get the currently focused terminal in this pane
     pub fn currentTerminal(self: *Pane) ?*c.VteTerminal {
+        if (self.tabs.items.len == 0) return null;
         const page = c.gtk_notebook_get_current_page(self.notebook);
         if (page < 0) return null;
         const idx: usize = @intCast(page);
@@ -492,6 +528,7 @@ pub const Pane = struct {
 
     /// Get the current tab
     pub fn currentTab(self: *Pane) ?*Tab {
+        if (self.tabs.items.len == 0) return null;
         const page = c.gtk_notebook_get_current_page(self.notebook);
         if (page < 0) return null;
         const idx: usize = @intCast(page);
@@ -516,6 +553,28 @@ pub const Pane = struct {
     pub fn getActiveProcessName(self: *Pane) ?[]const u8 {
         const leaf_pid = self.getLeafPid() orelse return null;
         return readProcComm(leaf_pid);
+    }
+
+    /// Push a process name into the ring buffer (called from report_process socket command).
+    pub fn pushProcessHistory(self: *Pane, name: []const u8) void {
+        if (name.len == 0) return;
+        const len = @min(name.len, 31);
+        @memcpy(self.proc_history[self.proc_history_idx][0..len], name[0..len]);
+        self.proc_history_lens[self.proc_history_idx] = @intCast(len);
+        self.proc_history_idx = (self.proc_history_idx + 1) % 16;
+        if (self.proc_history_count < 16) self.proc_history_count += 1;
+    }
+
+    /// Check if a process name appeared in recent history.
+    pub fn hasRecentProcess(self: *const Pane, name: []const u8) bool {
+        for (0..self.proc_history_count) |i| {
+            const idx = (self.proc_history_idx + 16 - 1 - i) % 16;
+            const plen = self.proc_history_lens[idx];
+            if (plen > 0 and std.mem.eql(u8, self.proc_history[idx][0..plen], name)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn getLeafPid(self: *Pane) ?std.c.pid_t {

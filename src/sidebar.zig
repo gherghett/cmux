@@ -257,26 +257,72 @@ pub const Sidebar = struct {
 
     // === Process icon mapping ===
 
+    const ProcessIcon = struct { ptr: [*:0]const u8 };
+
+    /// Known process → icon mappings. Checked against both the currently
+    /// running process and the recent command history from shell integration.
+    const icon_map = [_]struct { name: []const u8, icon: ProcessIcon }{
+        .{ .name = "claude", .icon = .{ .ptr = "🦀" } },
+        .{ .name = "node", .icon = .{ .ptr = "🟢" } },
+        .{ .name = "npm", .icon = .{ .ptr = "📦" } },
+        .{ .name = "git", .icon = .{ .ptr = "🔀" } },
+        .{ .name = "vim", .icon = .{ .ptr = "📝" } },
+        .{ .name = "nvim", .icon = .{ .ptr = "📝" } },
+        .{ .name = "docker", .icon = .{ .ptr = "🐳" } },
+        .{ .name = "make", .icon = .{ .ptr = "🔧" } },
+        .{ .name = "cargo", .icon = .{ .ptr = "📦" } },
+        .{ .name = "python3", .icon = .{ .ptr = "🐍" } },
+        .{ .name = "python", .icon = .{ .ptr = "🐍" } },
+    };
+
+    /// Shells — these are "idle", never shown as icons.
+    fn isShell(name: []const u8) bool {
+        return std.mem.eql(u8, name, "bash") or
+            std.mem.eql(u8, name, "zsh") or
+            std.mem.eql(u8, name, "fish") or
+            std.mem.eql(u8, name, "sh");
+    }
+
     /// Map a pane's active process to an emoji icon.
-    /// Returns null for idle shells (no icon shown).
-    fn getProcessIcon(pane: *Pane) ?struct { ptr: [*:0]const u8 } {
-        const name = pane.getActiveProcessName() orelse return null;
+    /// 1. If a mapped process is RUNNING NOW → show it (takes precedence).
+    /// 2. Else check command history: if any mapped process is ≥50% of
+    ///    total buffer entries → show the most frequent one.
+    fn getProcessIcon(pane: *Pane) ?ProcessIcon {
+        // 1. Currently running process takes precedence
+        if (pane.getActiveProcessName()) |name| {
+            if (!isShell(name)) {
+                for (icon_map) |entry| {
+                    if (std.mem.eql(u8, name, entry.name)) return entry.icon;
+                }
+            }
+        }
 
-        // Claude Code
-        if (std.mem.eql(u8, name, "claude")) return .{ .ptr = "🦀" };
+        // 2. Check history frequency
+        const total = pane.proc_history_count;
+        if (total == 0) return null;
 
-        // Node / npm
-        if (std.mem.eql(u8, name, "node")) return .{ .ptr = "🟢" };
-        if (std.mem.eql(u8, name, "npm")) return .{ .ptr = "📦" };
+        var best_icon: ?ProcessIcon = null;
+        var best_count: u8 = 0;
 
-        // Skip idle shells — no icon
-        if (std.mem.eql(u8, name, "bash")) return null;
-        if (std.mem.eql(u8, name, "zsh")) return null;
-        if (std.mem.eql(u8, name, "fish")) return null;
-        if (std.mem.eql(u8, name, "sh")) return null;
+        for (icon_map) |entry| {
+            var count: u8 = 0;
+            for (0..total) |i| {
+                const idx = (pane.proc_history_idx + 16 - 1 - i) % 16;
+                const plen = pane.proc_history_lens[idx];
+                if (plen > 0 and plen == entry.name.len and
+                    std.mem.eql(u8, pane.proc_history[idx][0..plen], entry.name))
+                {
+                    count += 1;
+                }
+            }
+            if (count > best_count) {
+                best_count = count;
+                best_icon = entry.icon;
+            }
+        }
 
-        // TODO: add more process → icon mappings here
-        // if (std.mem.eql(u8, name, "vim") or std.mem.eql(u8, name, "nvim")) return .{ .ptr = "📝" };
+        // Show if ≥50% of buffer
+        if (best_count * 2 >= total) return best_icon;
 
         return null;
     }

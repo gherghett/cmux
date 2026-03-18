@@ -70,13 +70,19 @@ fi
 stop_cmux
 check_stderr_clean
 
-# Also test a fresh start+split+close cycle for warnings
+# Test split+close pane cycle for GTK warnings
 full_cleanup
 start_xvfb
 start_cmux
-$CLI new_workspace >/dev/null 2>&1
 $CLI new_split h >/dev/null 2>&1
+$CLI new_split v >/dev/null 2>&1
 sleep 0.5
+# Close panes by sending exit to them (triggers onPaneEmpty → split_tree.close)
+$CLI send "exit\n" >/dev/null 2>&1
+sleep 2
+$CLI send "exit\n" >/dev/null 2>&1
+sleep 2
+$CLI ping >/dev/null 2>&1; check $? "alive after split+close pane cycle"
 stop_cmux
 check_stderr_clean
 

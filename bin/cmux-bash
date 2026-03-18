@@ -1,0 +1,11 @@
+#!/bin/bash
+# Wrapper that sources the user's bashrc + cmux shell integration.
+# Used by cmux as the shell command for dtach panes.
+
+# Source user's bashrc (if interactive, which we are)
+[ -f ~/.bashrc ] && source ~/.bashrc
+
+# Source cmux shell integration (process history, claude hooks)
+if [ -n "$CMUX_SHELL_INTEGRATION_DIR" ] && [ -f "$CMUX_SHELL_INTEGRATION_DIR/cmux-shell-init.sh" ]; then
+    source "$CMUX_SHELL_INTEGRATION_DIR/cmux-shell-init.sh"
+fi

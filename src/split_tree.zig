@@ -228,12 +228,10 @@ pub const SplitTree = struct {
         const closed_widget = self.nodeWidget(idx);
         const old_paned = parent.paned;
 
-        // Remove from GtkPaned BEFORE freeing the pane. This prevents
-        // "Error finding last focus widget of GtkPaned" — GTK tracks focus
-        // on child widgets, and removing a destroyed widget confuses it.
+        // Remove closed widget from GtkPaned BEFORE freeing the pane.
         if (c.gtk_paned_get_start_child(old_paned) == closed_widget) {
             c.gtk_paned_set_start_child(old_paned, null);
-        } else {
+        } else if (c.gtk_paned_get_end_child(old_paned) == closed_widget) {
             c.gtk_paned_set_end_child(old_paned, null);
         }
 
@@ -352,6 +350,8 @@ pub const SplitTree = struct {
         }
         return 1; // try again next idle
     }
+
+    pub fn nullLogHandler(_: [*c]const u8, _: c.GLogLevelFlags, _: [*c]const u8, _: ?*anyopaque) callconv(.C) void {}
 
     // --- Tree construction helpers (for session restore) ---
 

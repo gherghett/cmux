@@ -276,6 +276,7 @@ pub const SocketServer = struct {
         if (std.mem.eql(u8, cmd, "save_template")) return self.cmdSaveTemplate(args);
         if (std.mem.eql(u8, cmd, "load_template")) return self.cmdLoadTemplate(args);
         if (std.mem.eql(u8, cmd, "list_templates")) return session.listTemplates();
+        if (std.mem.eql(u8, cmd, "report_process")) return self.cmdReportProcess(args);
         return "ERROR: unknown command";
     }
 
@@ -634,6 +635,49 @@ pub const SocketServer = struct {
 
         if (self.tab_manager.on_change) |cb| cb(self.tab_manager.on_change_data);
 
+        return "OK";
+    }
+
+    fn cmdReportProcess(self: *SocketServer, args: []const u8) []const u8 {
+        // Parse: <process_name> [--tab=workspace_id] [--surface=surface_id]
+        var iter = std.mem.splitScalar(u8, args, ' ');
+        const proc_name = iter.first();
+        if (proc_name.len == 0) return "OK";
+
+        var surface_id: ?uuid.Uuid = null;
+        var target_ws: ?*Workspace = null;
+
+        while (iter.next()) |part| {
+            if (std.mem.startsWith(u8, part, "--tab=")) {
+                const ws_id_str = part[6..];
+                if (ws_id_str.len >= 36) {
+                    var ws_id: uuid.Uuid = undefined;
+                    @memcpy(&ws_id, ws_id_str[0..36]);
+                    target_ws = self.tab_manager.findWorkspace(&ws_id);
+                }
+            } else if (std.mem.startsWith(u8, part, "--surface=")) {
+                const sid_str = part[10..];
+                if (sid_str.len >= 36) {
+                    var sid: uuid.Uuid = undefined;
+                    @memcpy(&sid, sid_str[0..36]);
+                    surface_id = sid;
+                }
+            }
+        }
+
+        // Try to find the exact pane by surface ID
+        if (surface_id) |sid| {
+            if (self.tab_manager.findSurface(&sid)) |found| {
+                found.pane.pushProcessHistory(proc_name);
+                return "OK";
+            }
+        }
+
+        // Fallback: focused pane of target workspace
+        const ws = target_ws orelse self.tab_manager.current() orelse return "OK";
+        if (ws.split_tree.focusedPane()) |pane| {
+            pane.pushProcessHistory(proc_name);
+        }
         return "OK";
     }
 

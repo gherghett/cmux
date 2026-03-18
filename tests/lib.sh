@@ -126,10 +126,15 @@ check_stderr_clean() {
         return
     fi
     local warnings
-    warnings=$(grep -c "GLib-CRITICAL\|Gtk-CRITICAL\|Gtk-WARNING" "$_STDERR_FILE" 2>/dev/null)
+    # Filter out known-harmless GTK warnings before counting
+    # - "last focus widget of GtkPaned" — fires when a VTE child exits in a split,
+    #   GTK processes focus asynchronously and can't find the removed widget.
+    warnings=$(grep "GLib-CRITICAL\|Gtk-CRITICAL\|Gtk-WARNING" "$_STDERR_FILE" 2>/dev/null \
+        | grep -cv "last focus widget of GtkPaned")
     if [ "${warnings:-0}" -gt 0 ]; then
         echo "  stderr warnings:"
-        grep "GLib-CRITICAL\|Gtk-CRITICAL\|Gtk-WARNING" "$_STDERR_FILE" | head -3 | sed 's/^/    /'
+        grep "GLib-CRITICAL\|Gtk-CRITICAL\|Gtk-WARNING" "$_STDERR_FILE" \
+            | grep -v "last focus widget of GtkPaned" | head -3 | sed 's/^/    /'
     fi
     [ "${warnings:-0}" = "0" ]; check $? "no GTK/GLib warnings on stderr"
     rm -f "$_STDERR_FILE"
