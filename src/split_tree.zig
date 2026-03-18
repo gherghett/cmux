@@ -166,7 +166,7 @@ pub const SplitTree = struct {
         // Set initial 50/50 split position. We need the parent's size
         // to calculate, but the paned might not be allocated yet.
         // Use a one-shot idle callback to set position after layout.
-        _ = c.g_idle_add(@ptrCast(&onSetEqualSplit), paned);
+        requestEqualSplit(paned);
 
         // If there was a parent split, update its widget
         if (self.parents.items[split_idx] != INVALID) {
@@ -325,17 +325,30 @@ pub const SplitTree = struct {
         }
     }
 
+    const EqualSplitCtx = struct {
+        paned: *c.GtkPaned,
+        attempts: u16,
+    };
+
     fn onSetEqualSplit(user_data: ?*anyopaque) callconv(.C) c.gboolean {
-        const paned: *c.GtkPaned = @ptrCast(@alignCast(user_data orelse return 0));
-        const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(paned)));
+        const ctx: *EqualSplitCtx = @ptrCast(@alignCast(user_data orelse return 0));
+        const orientation = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(ctx.paned)));
         const total: c_int = if (orientation == c.GTK_ORIENTATION_HORIZONTAL)
-            c.gtk_widget_get_width(asWidget(paned))
+            c.gtk_widget_get_width(asWidget(ctx.paned))
         else
-            c.gtk_widget_get_height(asWidget(paned));
+            c.gtk_widget_get_height(asWidget(ctx.paned));
 
         if (total > 0) {
-            c.gtk_paned_set_position(paned, @divTrunc(total, 2));
+            c.gtk_paned_set_position(ctx.paned, @divTrunc(total, 2));
+            std.heap.c_allocator.destroy(ctx);
             return 0; // done
+        }
+        ctx.attempts += 1;
+        if (ctx.attempts > 100) {
+            // Give up — pane is probably on a hidden workspace.
+            // Position will be set when the workspace becomes visible.
+            std.heap.c_allocator.destroy(ctx);
+            return 0;
         }
         return 1; // try again next idle
     }
@@ -374,7 +387,9 @@ pub const SplitTree = struct {
 
     /// Request a 50/50 split position once the paned is laid out.
     pub fn requestEqualSplit(paned: *c.GtkPaned) void {
-        _ = c.g_idle_add(@ptrCast(&onSetEqualSplit), paned);
+        const ctx = std.heap.c_allocator.create(EqualSplitCtx) catch return;
+        ctx.* = .{ .paned = paned, .attempts = 0 };
+        _ = c.g_idle_add(@ptrCast(&onSetEqualSplit), ctx);
     }
 
     /// Get the first leaf starting from the root (for session restore focus).
