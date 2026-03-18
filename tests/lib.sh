@@ -2,7 +2,6 @@
 # Shared test helpers for cmux integration tests.
 # Source this from any test file: source "$(dirname "$0")/lib.sh"
 
-CMUX_DIR="${XDG_RUNTIME_DIR:-/tmp}/cmux"
 CLI="$(dirname "$0")/../zig-out/bin/cmux-cli"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_LOG="${PROJECT_DIR}/tests/test.log"
@@ -16,9 +15,14 @@ _CMUX_PID=""
 _TEST_DISPLAY=""
 _STDERR_FILE=""
 
-# Use a separate socket so tests never interfere with the user's running cmux
-TEST_SOCKET="$CMUX_DIR/cmux-test-$$.sock"
-export CMUX_SOCKET_PATH="$TEST_SOCKET"
+# Fully isolated runtime dir so tests NEVER touch the user's live session.
+# All cmux paths (socket, session.json, dtach sockets, logs) derive from
+# XDG_RUNTIME_DIR via runtime_dir.zig, so overriding it isolates everything.
+_REAL_XDG="${XDG_RUNTIME_DIR:-}"
+_TEST_RUNTIME_DIR="/tmp/cmux-test-$$"
+mkdir -p "$_TEST_RUNTIME_DIR"
+export XDG_RUNTIME_DIR="$_TEST_RUNTIME_DIR"
+CMUX_DIR="$_TEST_RUNTIME_DIR/cmux"
 
 log() {
     echo "$@" >> "$TEST_LOG"
@@ -43,35 +47,31 @@ full_cleanup() {
     _CMUX_PID=""
     _XVFB_PID=""
 
-    # Kill dtach sessions spawned by test cmux
-    pkill -f "dtach.*dtach-" 2>/dev/null || true
+    # Kill dtach sessions spawned by test cmux (only in test runtime dir)
+    if [ -n "$_TEST_RUNTIME_DIR" ]; then
+        pkill -f "dtach.*${_TEST_RUNTIME_DIR}" 2>/dev/null || true
+    fi
     sleep 1
 
-    rm -f "$TEST_SOCKET" "$_STDERR_FILE"
-    rm -f "$CMUX_DIR"/session.json "$CMUX_DIR"/dtach-*.sock
-    rm -f /tmp/cmux-session/layout.json /tmp/cmux-dtach-*.sock
+    rm -f "$_STDERR_FILE"
+    rm -rf "$_TEST_RUNTIME_DIR"
+    mkdir -p "$_TEST_RUNTIME_DIR"
     rm -rf "$HOME/.config/cmux/templates"
 }
 
 start_xvfb() {
-    Xvfb -screen 0 1280x1024x24 --auto-servernum &>/tmp/xvfb-test-$$.log &
+    # Use a high display number unlikely to conflict
+    _TEST_DISPLAY=99
+    Xvfb ":${_TEST_DISPLAY}" -screen 0 1280x1024x24 &>/dev/null &
     _XVFB_PID=$!
     sleep 1
-    _TEST_DISPLAY=$(grep -oP 'screen \K[0-9]+' /tmp/xvfb-test-$$.log 2>/dev/null)
-    if [ -z "$_TEST_DISPLAY" ]; then
-        _TEST_DISPLAY=99
-        kill "$_XVFB_PID" 2>/dev/null
-        Xvfb :99 -screen 0 1280x1024x24 &>/dev/null &
-        _XVFB_PID=$!
-        sleep 1
-    fi
-    rm -f /tmp/xvfb-test-$$.log
     export DISPLAY=":${_TEST_DISPLAY}"
 }
 
 start_cmux() {
     _STDERR_FILE="/tmp/cmux-test-stderr-$$.log"
-    "$PROJECT_DIR/zig-out/bin/cmux" >>"$TEST_LOG" 2>"$_STDERR_FILE" &
+    # Explicitly set DISPLAY to ensure cmux opens on Xvfb, not the user's screen
+    DISPLAY=":${_TEST_DISPLAY}" "$PROJECT_DIR/zig-out/bin/cmux" >>"$TEST_LOG" 2>"$_STDERR_FILE" &
     _CMUX_PID=$!
     sleep 3
     $CLI ping >/dev/null 2>&1

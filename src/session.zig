@@ -26,18 +26,39 @@ fn socketAlive(path: []const u8) bool {
     return true;
 }
 
-/// Kill a dtach process by connecting to its socket and sending exit,
+/// Kill a dtach process by finding its PID via /proc and sending SIGTERM,
 /// then deleting the socket file.
 fn killDtachBySocket(path: []const u8) void {
-    // Connect and send exit to the shell inside dtach
-    const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
-        // Can't connect — just remove the socket file
+    // Find the dtach process that owns this socket by scanning /proc
+    var dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch {
         std.fs.deleteFileAbsolute(path) catch {};
         return;
     };
-    // Send "exit\n" through the dtach socket to kill the shell
-    _ = posix.write(fd, "exit\n") catch {};
-    posix.close(fd);
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        const pid = std.fmt.parseInt(std.c.pid_t, entry.name, 10) catch continue;
+        if (pid <= 0) continue;
+
+        var cmdline_path_buf: [32]u8 = undefined;
+        const cmdline_path = std.fmt.bufPrint(&cmdline_path_buf, "/proc/{d}/cmdline", .{pid}) catch continue;
+        const file = std.fs.openFileAbsolute(cmdline_path, .{}) catch continue;
+        defer file.close();
+
+        var cmdline_buf: [512]u8 = undefined;
+        const n = file.read(&cmdline_buf) catch continue;
+        if (n == 0) continue;
+
+        const cmdline = cmdline_buf[0..n];
+        if (std.mem.indexOf(u8, cmdline, "dtach") == null) continue;
+        if (std.mem.indexOf(u8, cmdline, path) != null) {
+            // Found it — kill the dtach process and its children
+            _ = std.posix.kill(pid, 15) catch {}; // SIGTERM
+            break;
+        }
+    }
+
     std.fs.deleteFileAbsolute(path) catch {};
 }
 
