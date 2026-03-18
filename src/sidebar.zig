@@ -255,6 +255,32 @@ pub const Sidebar = struct {
         return 1;
     }
 
+    // === Process icon mapping ===
+
+    /// Map a pane's active process to an emoji icon.
+    /// Returns null for idle shells (no icon shown).
+    fn getProcessIcon(pane: *Pane) ?struct { ptr: [*:0]const u8 } {
+        const name = pane.getActiveProcessName() orelse return null;
+
+        // Claude Code
+        if (std.mem.eql(u8, name, "claude")) return .{ .ptr = "🦀" };
+
+        // Node / npm
+        if (std.mem.eql(u8, name, "node")) return .{ .ptr = "🟢" };
+        if (std.mem.eql(u8, name, "npm")) return .{ .ptr = "📦" };
+
+        // Skip idle shells — no icon
+        if (std.mem.eql(u8, name, "bash")) return null;
+        if (std.mem.eql(u8, name, "zsh")) return null;
+        if (std.mem.eql(u8, name, "fish")) return null;
+        if (std.mem.eql(u8, name, "sh")) return null;
+
+        // TODO: add more process → icon mappings here
+        // if (std.mem.eql(u8, name, "vim") or std.mem.eql(u8, name, "nvim")) return .{ .ptr = "📝" };
+
+        return null;
+    }
+
     // === Text-based minimap drawing ===
 
     const Color = struct { r: f64, g: f64, b: f64 };
@@ -339,6 +365,45 @@ pub const Sidebar = struct {
         // Draw each pane
         for (layouts[0..layout_count]) |layout| {
             drawPaneMinimap(cairo, layout);
+        }
+
+        // Draw process icons on each pane (top-left corner) using Pango for emoji support
+        for (layouts[0..layout_count]) |layout| {
+            if (getProcessIcon(layout.pane)) |icon| {
+                const icon_size = @max(@min(layout.h * 0.55, layout.w * 0.5), 6.0);
+                const pango_layout = c.pango_cairo_create_layout(cairo) orelse continue;
+                defer c.g_object_unref(@ptrCast(pango_layout));
+
+                const font_desc = c.pango_font_description_from_string("emoji");
+                if (font_desc) |fd| {
+                    c.pango_font_description_set_absolute_size(fd, icon_size * @as(f64, c.PANGO_SCALE));
+                    c.pango_layout_set_font_description(pango_layout, fd);
+                    c.pango_font_description_free(fd);
+                }
+
+                c.pango_layout_set_text(pango_layout, icon.ptr, -1);
+                c.cairo_move_to(cairo, layout.x + 1, layout.y + 1);
+                c.pango_cairo_show_layout(cairo, pango_layout);
+            }
+        }
+
+        // Draw divider lines between panes for visible split boundaries
+        if (layout_count > 1) {
+            c.cairo_set_source_rgba(cairo, 0.5, 0.5, 0.55, 0.9);
+            c.cairo_set_line_width(cairo, 1.0);
+            for (layouts[0..layout_count]) |layout| {
+                // Right edge (vertical split divider)
+                if (layout.x + layout.w < w - 1) {
+                    c.cairo_move_to(cairo, layout.x + layout.w, layout.y);
+                    c.cairo_line_to(cairo, layout.x + layout.w, layout.y + layout.h);
+                }
+                // Bottom edge (horizontal split divider)
+                if (layout.y + layout.h < h - 1) {
+                    c.cairo_move_to(cairo, layout.x, layout.y + layout.h);
+                    c.cairo_line_to(cairo, layout.x + layout.w, layout.y + layout.h);
+                }
+            }
+            c.cairo_stroke(cairo);
         }
     }
 

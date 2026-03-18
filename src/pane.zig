@@ -40,6 +40,12 @@ pub const Pane = struct {
     browser_tabs: [16]?BrowserTab = [_]?BrowserTab{null} ** 16,
     browser_tab_box: ?*c.GtkBox = null, // container for browser tab buttons in overlay
 
+    /// Cached dtach master PID — avoids scanning all of /proc on every refresh.
+    dtach_master_pid: std.c.pid_t = 0,
+    /// Cached leaf (deepest child) PID + timestamp. Expires after 1 second.
+    cached_leaf_pid: std.c.pid_t = 0,
+    cached_leaf_time: i64 = 0,
+
     pub const Tab = struct {
         id: uuid.Uuid,
         terminal: *c.VteTerminal,
@@ -501,16 +507,44 @@ pub const Pane = struct {
     /// /proc for our stored socket path, then walk its children to find the
     /// deepest (foreground) process.
     pub fn getCwd(self: *Pane) ?[*:0]const u8 {
-        if (self.dtach_path_len == 0) return null;
-        const dtach_path = self.dtach_path[0..self.dtach_path_len];
-
-        // Find the dtach master process that owns our socket
-        const dtach_pid = findDtachPidBySocket(dtach_path) orelse return null;
-
-        // Walk its children to find the deepest (foreground command)
-        const leaf_pid = findDeepestChild(dtach_pid);
-
+        const leaf_pid = self.getLeafPid() orelse return null;
         return readProcCwd(leaf_pid);
+    }
+
+    /// Get the name of the active (deepest child) process in this pane.
+    /// Returns the process name (e.g. "claude", "npm", "bash") or null.
+    pub fn getActiveProcessName(self: *Pane) ?[]const u8 {
+        const leaf_pid = self.getLeafPid() orelse return null;
+        return readProcComm(leaf_pid);
+    }
+
+    fn getLeafPid(self: *Pane) ?std.c.pid_t {
+        if (self.dtach_path_len == 0) return null;
+
+        // Return cached leaf if fresh (within 1 second)
+        const now = std.time.milliTimestamp();
+        if (self.cached_leaf_pid > 0 and (now - self.cached_leaf_time) < 1000) {
+            return self.cached_leaf_pid;
+        }
+
+        // Find dtach master PID (cached, rarely changes)
+        if (self.dtach_master_pid <= 0) {
+            const dtach_path = self.dtach_path[0..self.dtach_path_len];
+            self.dtach_master_pid = findDtachPidBySocket(dtach_path) orelse return null;
+        }
+
+        // Walk children (cheap — just a few /proc reads down the tree)
+        const leaf = findDeepestChild(self.dtach_master_pid);
+        if (leaf <= 0) {
+            // dtach might have died, clear cache
+            self.dtach_master_pid = 0;
+            self.cached_leaf_pid = 0;
+            return null;
+        }
+
+        self.cached_leaf_pid = leaf;
+        self.cached_leaf_time = now;
+        return leaf;
     }
 
     /// Find the dtach master process PID by scanning /proc for a process
@@ -575,6 +609,23 @@ pub const Pane = struct {
         }
         return pid;
     }
+
+    /// Read /proc/<pid>/comm — the process name (e.g. "claude", "bash").
+    /// Returns a slice into a static buffer, or null.
+    fn readProcComm(pid: std.c.pid_t) ?[]const u8 {
+        var path_buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return null;
+        const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+        defer file.close();
+        const n = file.read(&comm_buf) catch return null;
+        if (n == 0) return null;
+        // comm has a trailing newline
+        const name = std.mem.trim(u8, comm_buf[0..n], "\n ");
+        if (name.len == 0) return null;
+        return name;
+    }
+
+    var comm_buf: [64]u8 = undefined;
 
     fn readProcCwd(pid: std.c.pid_t) ?[*:0]const u8 {
         var proc_path_buf: [64]u8 = undefined;
