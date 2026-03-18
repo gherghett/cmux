@@ -23,9 +23,12 @@ if [[ -n "$CMUX_SURFACE_ID" ]]; then
 fi
 
 if [[ -n "$CMUX_SURFACE_ID" && "$CMUX_CLAUDE_HOOKS_DISABLED" != "1" ]]; then
+    # Cache the real claude binary path BEFORE defining our wrapper function.
+    __cmux_real_claude="$(command -v claude 2>/dev/null)"
+
     claude() {
-        local real_claude
-        real_claude="$(command -v claude)" || { echo "Error: claude not found" >&2; return 127; }
+        local real_claude="${__cmux_real_claude}"
+        [[ -z "$real_claude" || ! -x "$real_claude" ]] && { echo "Error: claude not found" >&2; return 127; }
 
         # Pass through non-interactive subcommands
         case "${1:-}" in
