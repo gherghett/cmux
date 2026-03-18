@@ -24,6 +24,8 @@ mkdir -p "$_TEST_RUNTIME_DIR"
 export XDG_RUNTIME_DIR="$_TEST_RUNTIME_DIR"
 CMUX_DIR="$_TEST_RUNTIME_DIR/cmux"
 
+# ── Helpers ──────────────────────────────────────────────
+
 log() {
     echo "$@" >> "$TEST_LOG"
 }
@@ -40,18 +42,47 @@ check() {
     fi
 }
 
+## Poll until a command succeeds or timeout (in seconds).
+## Usage: wait_for 5 '$CLI ping >/dev/null 2>&1'
+wait_for() {
+    local timeout=$1; shift
+    for i in $(seq 1 "$timeout"); do
+        if eval "$@" 2>/dev/null; then return 0; fi
+        sleep 1
+    done
+    return 1
+}
+
+## Wait until a PID is no longer running, with timeout.
+wait_pid_gone() {
+    local pid=$1 timeout=${2:-5}
+    for i in $(seq 1 "$timeout"); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 1
+    done
+    # Still alive after timeout — force kill
+    kill -9 "$pid" 2>/dev/null
+    return 1
+}
+
+# ── Lifecycle ────────────────────────────────────────────
+
 full_cleanup() {
-    # Only kill processes WE started, not the user's cmux
-    [ -n "$_CMUX_PID" ] && kill -9 "$_CMUX_PID" 2>/dev/null
+    # SIGTERM first (lets cmux save session), then SIGKILL if stuck
+    if [ -n "$_CMUX_PID" ]; then
+        kill "$_CMUX_PID" 2>/dev/null
+        wait_pid_gone "$_CMUX_PID" 3
+    fi
     [ -n "$_XVFB_PID" ] && kill -9 "$_XVFB_PID" 2>/dev/null
     _CMUX_PID=""
     _XVFB_PID=""
 
-    # Kill dtach sessions spawned by test cmux (only in test runtime dir)
+    # Kill dtach sessions spawned by test cmux (only in test runtime dir).
+    # Must happen BEFORE removing the dir so the pattern still matches.
     if [ -n "$_TEST_RUNTIME_DIR" ]; then
-        pkill -f "dtach.*${_TEST_RUNTIME_DIR}" 2>/dev/null || true
+        pkill -9 -f "dtach.*${_TEST_RUNTIME_DIR}" 2>/dev/null || true
+        sleep 0.5
     fi
-    sleep 1
 
     rm -f "$_STDERR_FILE"
     rm -rf "$_TEST_RUNTIME_DIR"
@@ -60,28 +91,33 @@ full_cleanup() {
 }
 
 start_xvfb() {
-    # Use a high display number unlikely to conflict
     _TEST_DISPLAY=99
     Xvfb ":${_TEST_DISPLAY}" -screen 0 1280x1024x24 &>/dev/null &
     _XVFB_PID=$!
-    sleep 1
+    sleep 0.5
     export DISPLAY=":${_TEST_DISPLAY}"
 }
 
 start_cmux() {
     _STDERR_FILE="/tmp/cmux-test-stderr-$$.log"
-    # Explicitly set DISPLAY to ensure cmux opens on Xvfb, not the user's screen
     DISPLAY=":${_TEST_DISPLAY}" "$PROJECT_DIR/zig-out/bin/cmux" >>"$TEST_LOG" 2>"$_STDERR_FILE" &
     _CMUX_PID=$!
-    sleep 3
-    $CLI ping >/dev/null 2>&1
+    # Poll for socket instead of fixed sleep
+    if ! wait_for 10 '$CLI ping >/dev/null 2>&1'; then
+        echo "  ERROR: cmux failed to start (ping timeout)" >&2
+        return 1
+    fi
 }
 
 stop_cmux() {
-    [ -n "$_CMUX_PID" ] && kill "$_CMUX_PID" 2>/dev/null
-    sleep 3
-    _CMUX_PID=""
+    if [ -n "$_CMUX_PID" ]; then
+        kill "$_CMUX_PID" 2>/dev/null  # SIGTERM — lets it save session
+        wait_pid_gone "$_CMUX_PID" 5
+        _CMUX_PID=""
+    fi
 }
+
+# ── Assertions ───────────────────────────────────────────
 
 # Check stderr for GTK/GLib warnings after a test run.
 # Call after stop_cmux. Fails the test if any warnings found.

@@ -14,13 +14,12 @@ $CLI rename_workspace "$($CLI current_workspace | cut -f1)" "legit-ws" >/dev/nul
 # Spawn an orphan dtach NOT tracked by any workspace
 ORPHAN_SOCK="$CMUX_DIR/dtach-orphan-test-$$.sock"
 dtach -n "$ORPHAN_SOCK" /bin/bash 2>/dev/null
-sleep 1
+wait_for 3 '[ -S "$ORPHAN_SOCK" ]'
 
 stop_cmux
 
 # Restart — reconciliation should kill the orphan
 start_cmux
-sleep 1
 
 ORPHAN_AFTER=0
 [ -S "$ORPHAN_SOCK" ] && ORPHAN_AFTER=1
@@ -32,7 +31,7 @@ echo "$WS_LIST" | grep -q "legit-ws"; check $? "legitimate workspace preserved"
 # --- Env vars correct ---
 ENVFILE="/tmp/cmux-env-test-$$"
 $CLI send "env | grep CMUX_ > $ENVFILE 2>/dev/null\n" >/dev/null 2>&1
-sleep 2
+wait_for 5 '[ -f "$ENVFILE" ] && [ -s "$ENVFILE" ]'
 
 if [ -f "$ENVFILE" ]; then
     TAB_ID=$(grep "CMUX_TAB_ID=" "$ENVFILE" | cut -d= -f2)
@@ -57,7 +56,7 @@ WS_AFTER=$($CLI list_workspaces 2>/dev/null | grep "legit-ws" | cut -f1)
 # --- CMUX_WORKSPACE_ID valid in dtach after restart ---
 ENVFILE2="/tmp/cmux-env-test2-$$"
 $CLI send "echo CMUX_WORKSPACE_ID=\$CMUX_WORKSPACE_ID > $ENVFILE2\n" >/dev/null 2>&1
-sleep 2
+wait_for 5 '[ -f "$ENVFILE2" ] && [ -s "$ENVFILE2" ]'
 
 if [ -f "$ENVFILE2" ]; then
     SHELL_WS_ID=$(grep "CMUX_WORKSPACE_ID=" "$ENVFILE2" | cut -d= -f2)
@@ -77,7 +76,7 @@ start_xvfb
 start_cmux
 $CLI new_workspace >/dev/null 2>&1
 $CLI new_split h >/dev/null 2>&1
-sleep 1
+sleep 0.5
 stop_cmux
 check_stderr_clean
 
