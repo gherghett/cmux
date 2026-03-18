@@ -126,9 +126,9 @@ check_stderr_clean() {
         return
     fi
     local warnings
-    # Filter out known-harmless GTK warnings before counting
-    # - "last focus widget of GtkPaned" — fires when a VTE child exits in a split,
-    #   GTK processes focus asynchronously and can't find the removed widget.
+    # Filter known GTK4 limitation: "last focus widget of GtkPaned" warning fires
+    # when a VTE child exits in a split — GTK processes focus-loss asynchronously
+    # before our callback can intervene. Harmless, no state corruption.
     warnings=$(grep "GLib-CRITICAL\|Gtk-CRITICAL\|Gtk-WARNING" "$_STDERR_FILE" 2>/dev/null \
         | grep -cv "last focus widget of GtkPaned")
     if [ "${warnings:-0}" -gt 0 ]; then

@@ -224,24 +224,26 @@ pub const SplitTree = struct {
         const grandparent_idx = self.parents.items[parent_idx];
         self.parents.items[sibling_idx] = grandparent_idx;
 
-        // Get widget refs BEFORE freeing the pane
-        const closed_widget = self.nodeWidget(idx);
         const old_paned = parent.paned;
 
-        // Remove closed widget from GtkPaned BEFORE freeing the pane.
+        // Remove closed widget from GtkPaned before freeing the pane.
+        // NOTE: gtk_paned_set_start/end_child(null) triggers a harmless GTK
+        // warning "Error finding last focus widget of GtkPaned" because GTK
+        // internally processes focus-loss from the exited VTE child before our
+        // callback fires. This is a GTK4 limitation — we cannot intercept the
+        // async focus event. The warning is cosmetic and does not affect state.
+        const closed_widget = self.nodeWidget(idx);
         if (c.gtk_paned_get_start_child(old_paned) == closed_widget) {
             c.gtk_paned_set_start_child(old_paned, null);
         } else if (c.gtk_paned_get_end_child(old_paned) == closed_widget) {
             c.gtk_paned_set_end_child(old_paned, null);
         }
 
-        // Now safe to free the pane. Kill dtach if user-initiated.
+        // Free the closed pane. Kill dtach if user-initiated.
         if (kill_dtach) self.nodes.items[idx].leaf.pane.close() else self.nodes.items[idx].leaf.pane.deinit();
         self.nodes.items[idx] = .dead;
 
-        // Update tree structure: sibling replaces parent in the tree.
-        // The old GtkPaned stays in the widget hierarchy as a pass-through
-        // container with one child. Visually transparent.
+        // Update tree structure: sibling replaces parent.
         if (grandparent_idx == INVALID) {
             self.root = sibling_idx;
         } else {
@@ -252,6 +254,7 @@ pub const SplitTree = struct {
                 gp.second = sibling_idx;
             }
         }
+
         self.parents.items[sibling_idx] = grandparent_idx;
 
         // Focus the sibling (or its first leaf if it's a split)
@@ -350,8 +353,6 @@ pub const SplitTree = struct {
         }
         return 1; // try again next idle
     }
-
-    pub fn nullLogHandler(_: [*c]const u8, _: c.GLogLevelFlags, _: [*c]const u8, _: ?*anyopaque) callconv(.C) void {}
 
     // --- Tree construction helpers (for session restore) ---
 
