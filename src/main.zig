@@ -83,9 +83,12 @@ pub fn main() !void {
     const allocator = std.heap.c_allocator;
     const socket_path = std.posix.getenv("CMUX_SOCKET_PATH") orelse runtime_dir.socketPath();
 
+    // G_APPLICATION_NON_UNIQUE: each cmux process is independent.
+    // Without this, GTK merges instances with the same app ID — a second
+    // cmux would activate the first one's window instead of starting fresh.
     const app: *c.AdwApplication = c.adw_application_new(
         "dev.cmux.terminal",
-        c.G_APPLICATION_DEFAULT_FLAGS,
+        c.G_APPLICATION_NON_UNIQUE,
     ) orelse {
         log.err("failed to create AdwApplication", .{});
         return error.ApplicationCreateFailed;
