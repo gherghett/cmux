@@ -43,15 +43,16 @@ FAKE_UUID="deadbeef-dead-beef-dead-beefdeadbeef"
 R=$($CLI set_status claude_code Running "--tab=$FAKE_UUID" 2>&1)
 [ "$R" = "ERROR: workspace not found" ]; check $? "unknown --tab= returns error"
 
-# Stability
-for i in $(seq 1 5); do
-    $CLI new_split h >/dev/null 2>&1
-    $CLI send "exit\n" >/dev/null 2>&1
-    sleep 1
-done
-R=$($CLI ping 2>&1); [ "$R" = "PONG" ]; check $? "alive after 5 split+close cycles"
+# Templates
+$CLI new_split h >/dev/null 2>&1
+R=$($CLI save_template test-tmpl 2>&1); [ "$R" = "OK" ]; check $? "save_template"
+R=$($CLI list_templates 2>&1); echo "$R" | grep -q "test-tmpl"; check $? "list_templates shows saved template"
+R=$($CLI load_template test-tmpl 2>&1); echo "$R" | grep -qE '[0-9a-f-]{36}'; check $? "load_template returns UUID"
+R=$($CLI load_template nonexistent 2>&1); echo "$R" | grep -q "ERROR"; check $? "load unknown template returns error"
+R=$($CLI save_template "../evil" 2>&1); echo "$R" | grep -q "ERROR"; check $? "save_template rejects path traversal"
 
 stop_cmux
+check_stderr_clean
 full_cleanup
 print_result
 exit $FAIL

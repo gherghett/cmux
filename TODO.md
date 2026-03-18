@@ -10,7 +10,26 @@
 - [ ] **Restore orphaned session dialog** — when reconciliation finds an untracked-but-alive dtach, show a GTK dialog asking "Found orphaned terminal session. Restore or kill?" instead of auto-killing. Useful when Claude is running in an orphaned dtach.
 - [ ] **Cursor blink after dtach reattach** — after session restore, the cursor blinks even in TUI apps (like Claude Code) where it shouldn't. dtach reattach may not fully restore terminal state. Investigate: VTE cursor blink settings, or sending a terminal reset sequence after reattach.
 - [ ] **Screen content not restored on reattach** — dtach preserves the process but not the terminal scrollback/screen. After restart, TUI apps show a blank screen (the process is alive — pressing Enter continues). This is a dtach limitation. Investigate: `dtach -r` vs `-a`, abduco (dtach alternative with screen redraw), or sending a SIGWINCH to force TUI redraw.
+- [ ] **Minimap not updated for restored workspaces until focused** — after session restore, workspace minimaps stay blank/stale until you switch to that workspace at least once. VTE probably doesn't render content until the widget is visible in the GtkStack. Might need to force a snapshot after restore or mark minimap dirty.
 - [ ] **Session file >32KB** — restore uses a 32KB static buffer. Large sessions (many workspaces, long CWD paths) could be truncated. Switch to heap allocation or streaming read.
+
+## Workspace lifetime
+
+A workspace is a live instance (vert-tab + split tree + panes with dtach sessions). A template is a saved blueprint (title + layout + CWDs, no processes). Templates live on disk as JSON files.
+
+- [ ] **`save-workspace <name>`** — serialize current workspace's layout + CWDs to `~/.config/cmux/templates/<name>.json`. No dtach paths, no process state — just shape and directories. Format: `{ "title": "...", "tree": { "split": "h", "first": { "cwd": "..." }, "second": { "cwd": "..." } } }`
+- [ ] **`open-workspace <name>`** — read template, create a new workspace with that split layout, spawn fresh shells in the saved CWDs. Socket protocol: `open_workspace <name> → id` and `save_workspace <name> → OK`.
+- [ ] **Template storage** — `~/.config/cmux/templates/` directory, one JSON file per template. Human-readable, hand-editable.
+- [ ] **`list-templates`** — list available templates. Socket protocol: `list_templates → name per line`.
+- [ ] **Close workspace kills processes** — already works (killDtach on all panes). Document this as the expected behavior.
+
+### Future — workspace operations
+
+- [ ] **Move pane between workspaces** — detach a pane's dtach socket from one workspace's split tree, reattach in another. The process keeps running. dtach makes this possible.
+- [ ] **Create workspace from pane** — take a pane out of a split and promote it to its own workspace (vert-tab). Inverse of the above.
+- [ ] **Layout templates** — separate the layout shape from the CWDs. Apply a layout template to an existing workspace (rearrange panes without killing them). Tentative.
+- [ ] **Multiple OS windows** — open additional GTK windows showing different workspaces from the same instance. Most GUI apps do this. Shared workspace list, shared Claude status/notifications.
+- [ ] **Template in menus** — right-click sidebar → "New from template..." dropdown. Requires config/UI for managing templates. Comes after CLI-first approach works.
 
 ## Claude Code integration
 

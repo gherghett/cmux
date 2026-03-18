@@ -6,6 +6,7 @@ const TabManager = @import("tab_manager.zig").TabManager;
 const Workspace = @import("workspace.zig").Workspace;
 const Pane = @import("pane.zig").Pane;
 const SplitTree = @import("split_tree.zig").SplitTree;
+const session = @import("session.zig");
 
 const log = std.log.scoped(.socket);
 const posix = std.posix;
@@ -272,6 +273,9 @@ pub const SocketServer = struct {
         if (std.mem.eql(u8, cmd, "report_meta")) return self.cmdSetStatus(args); // alias
         if (std.mem.eql(u8, cmd, "clear_meta")) return self.cmdClearStatus(args); // alias
         if (std.mem.eql(u8, cmd, "rename_workspace")) return self.cmdRenameWorkspace(args);
+        if (std.mem.eql(u8, cmd, "save_template")) return self.cmdSaveTemplate(args);
+        if (std.mem.eql(u8, cmd, "load_template")) return self.cmdLoadTemplate(args);
+        if (std.mem.eql(u8, cmd, "list_templates")) return session.listTemplates();
         return "ERROR: unknown command";
     }
 
@@ -395,6 +399,23 @@ pub const SocketServer = struct {
                 var ws_id: uuid.Uuid = undefined;
                 @memcpy(&ws_id, flag_rest[0..36]);
                 target_ws_id = ws_id;
+            }
+        }
+
+        // Skip desktop notification if the target workspace is active AND
+        // the cmux window has focus (user is already looking at it)
+        if (target_ws_id) |twid| {
+            const target_ws = self.tab_manager.findWorkspace(&twid);
+            if (target_ws != null and self.tab_manager.current() == target_ws.?) {
+                const app = c.g_application_get_default();
+                if (app) |a| {
+                    const win = c.gtk_application_get_active_window(@ptrCast(@alignCast(a)));
+                    if (win) |w| {
+                        if (c.gtk_window_is_active(w) != 0) {
+                            return "OK"; // suppressed — user is looking at this workspace
+                        }
+                    }
+                }
             }
         }
 
@@ -530,18 +551,32 @@ pub const SocketServer = struct {
         const value = value_buf[0..value_len];
 
         // Route claude_code and claude_message through dedicated API
+        // "Active" means: this workspace is selected AND the cmux window has focus.
+        // If cmux is in the background, we still want notifications.
+        const is_selected = (self.tab_manager.current() == ws);
+        const win_focused = blk: {
+            const app = c.g_application_get_default() orelse break :blk false;
+            const win = c.gtk_application_get_active_window(@ptrCast(@alignCast(app)));
+            if (win) |w| break :blk c.gtk_window_is_active(w) != 0;
+            break :blk false;
+        };
+        const is_active = is_selected and win_focused;
         if (std.mem.eql(u8, key, "claude_code")) {
             if (std.mem.eql(u8, value, "Running")) {
                 ws.setClaudeStatus(.running);
             } else if (std.mem.eql(u8, value, "Unread")) {
-                // Only show unread if not currently active
-                const is_active = (self.tab_manager.current() == ws);
-                if (!is_active) {
+                if (is_active) {
+                    ws.setClaudeStatus(.none);
+                } else {
                     ws.setClaudeStatus(.unread);
                 }
             } else {
                 // "Needs input", "Permission", etc. → attention
-                ws.setClaudeStatus(.attention);
+                // Only escalate if workspace is inactive AND not already running
+                // (don't nag if user is looking at it, don't downgrade running)
+                if (!is_active and ws.claude_status != .running) {
+                    ws.setClaudeStatus(.attention);
+                }
             }
         } else if (std.mem.eql(u8, key, "claude_message")) {
             ws.setClaudeMessage(value);
@@ -574,9 +609,14 @@ pub const SocketServer = struct {
         const ws = target_ws orelse self.tab_manager.current() orelse return "ERROR: no workspace";
 
         if (std.mem.eql(u8, key, "claude_code")) {
-            // Transition to unread if not active, none if active
-            const is_active = (self.tab_manager.current() == ws);
-            ws.clearClaudeStatus(is_active);
+            const is_selected = (self.tab_manager.current() == ws);
+            const win_focused = blk: {
+                const app = c.g_application_get_default() orelse break :blk false;
+                const win = c.gtk_application_get_active_window(@ptrCast(@alignCast(app)));
+                if (win) |w| break :blk c.gtk_window_is_active(w) != 0;
+                break :blk false;
+            };
+            ws.clearClaudeStatus(is_selected and win_focused);
         }
 
         if (self.tab_manager.on_change) |cb| cb(self.tab_manager.on_change_data);
@@ -595,6 +635,21 @@ pub const SocketServer = struct {
         if (self.tab_manager.on_change) |cb| cb(self.tab_manager.on_change_data);
 
         return "OK";
+    }
+
+    fn cmdSaveTemplate(self: *SocketServer, args: []const u8) []const u8 {
+        const name = std.mem.trim(u8, args, " ");
+        if (name.len == 0) return "ERROR: usage: save_template <name>";
+        const ws = self.tab_manager.current() orelse return "ERROR: no workspace";
+        return session.saveTemplate(ws, name);
+    }
+
+    fn cmdLoadTemplate(self: *SocketServer, args: []const u8) []const u8 {
+        const name = std.mem.trim(u8, args, " ");
+        if (name.len == 0) return "ERROR: usage: load_template <name>";
+        const result = session.loadTemplate(self.tab_manager, name);
+        if (self.tab_manager.on_change) |cb| cb(self.tab_manager.on_change_data);
+        return result;
     }
 };
 

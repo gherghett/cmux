@@ -93,7 +93,7 @@ fn writeWorkspace(w: anytype, ws: *Workspace) void {
     // Split tree (recursive)
     w.writeAll(",\n      \"tree\": ") catch return;
     if (ws.split_tree.root != SplitTree.INVALID) {
-        writeTreeNode(w, &ws.split_tree, ws.split_tree.root);
+        writeTreeNode(w, &ws.split_tree, ws.split_tree.root, false);
     } else {
         w.writeAll("null") catch return;
     }
@@ -101,15 +101,19 @@ fn writeWorkspace(w: anytype, ws: *Workspace) void {
     w.writeAll("\n    }") catch return;
 }
 
-fn writeTreeNode(w: anytype, tree: *const SplitTree, idx: SplitTree.NodeIndex) void {
+fn writeTreeNode(w: anytype, tree: *const SplitTree, idx: SplitTree.NodeIndex, skip_dtach: bool) void {
     switch (tree.nodes.items[idx]) {
         .dead => return,
         .leaf => |leaf| {
-            w.writeAll("{ \"dtach\": \"") catch return;
-            if (leaf.pane.dtach_path_len > 0) {
-                w.writeAll(leaf.pane.dtach_path[0..leaf.pane.dtach_path_len]) catch return;
+            w.writeAll("{ ") catch return;
+            if (!skip_dtach) {
+                w.writeAll("\"dtach\": \"") catch return;
+                if (leaf.pane.dtach_path_len > 0) {
+                    w.writeAll(leaf.pane.dtach_path[0..leaf.pane.dtach_path_len]) catch return;
+                }
+                w.writeAll("\", ") catch return;
             }
-            w.writeAll("\", \"cwd\": \"") catch return;
+            w.writeAll("\"cwd\": \"") catch return;
             if (leaf.pane.getCwd()) |cwd_ptr| {
                 writeJsonEscaped(w, std.mem.span(cwd_ptr));
             }
@@ -119,9 +123,9 @@ fn writeTreeNode(w: anytype, tree: *const SplitTree, idx: SplitTree.NodeIndex) v
             w.writeAll("{ \"split\": \"") catch return;
             w.writeAll(if (s.direction == .horizontal) "h" else "v") catch return;
             w.writeAll("\", \"first\": ") catch return;
-            writeTreeNode(w, tree, s.first);
+            writeTreeNode(w, tree, s.first, skip_dtach);
             w.writeAll(", \"second\": ") catch return;
-            writeTreeNode(w, tree, s.second);
+            writeTreeNode(w, tree, s.second, skip_dtach);
             w.writeAll(" }") catch return;
         },
     }
@@ -560,6 +564,187 @@ fn restoreWorkspaceLegacy(ws: *Workspace, ws_json: []const u8, allocator: std.me
     }
 
     return true;
+}
+
+// ──────────────────────────────────────────────────────────
+// Templates — saved workspace layouts (no dtach, just shape + CWDs)
+// ──────────────────────────────────────────────────────────
+
+const template_dir = "/home/" ++ ""; // computed at runtime
+var template_dir_buf: [256]u8 = undefined;
+var template_dir_len: usize = 0;
+var template_dir_initialized: bool = false;
+
+fn getTemplateDir() []const u8 {
+    if (!template_dir_initialized) {
+        const home = posix.getenv("HOME") orelse "/tmp";
+        template_dir_len = (std.fmt.bufPrint(&template_dir_buf, "{s}/.config/cmux/templates", .{home}) catch return "/tmp").len;
+        template_dir_initialized = true;
+    }
+    return template_dir_buf[0..template_dir_len];
+}
+
+/// Validate a template name: alphanumeric, dash, underscore, dot only. Max 64 chars.
+fn isValidTemplateName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '_' and ch != '.') return false;
+    }
+    return true;
+}
+
+/// Save the current workspace's layout + CWDs as a named template.
+/// Writes to ~/.config/cmux/templates/<name>.json
+pub fn saveTemplate(ws: *Workspace, name: []const u8) []const u8 {
+    if (!isValidTemplateName(name)) return "ERROR: invalid template name (use a-z, 0-9, dash, underscore, dot; max 64 chars)";
+
+    const dir = getTemplateDir();
+
+    // Ensure directory exists (create parents)
+    ensureTemplateDir(dir);
+
+    // Build file path
+    var path_buf: [384]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ dir, name }) catch
+        return "ERROR: template name too long";
+
+    const file = std.fs.createFileAbsolute(path, .{}) catch |err| {
+        log.err("failed to create template file {s}: {}", .{ path, err });
+        return "ERROR: cannot write template file";
+    };
+    defer file.close();
+
+    const w = file.writer();
+    w.writeAll("{\n  \"title\": \"") catch return "ERROR: write failed";
+    writeJsonEscaped(w, ws.displayTitle());
+    w.writeAll("\",\n  \"tree\": ") catch return "ERROR: write failed";
+
+    if (ws.split_tree.root != SplitTree.INVALID) {
+        writeTreeNode(w, &ws.split_tree, ws.split_tree.root, true);
+    } else {
+        // Empty workspace → single pane at $HOME
+        w.writeAll("{ \"cwd\": \"") catch return "ERROR: write failed";
+        const home = posix.getenv("HOME") orelse "/tmp";
+        writeJsonEscaped(w, home);
+        w.writeAll("\" }") catch return "ERROR: write failed";
+    }
+
+    w.writeAll("\n}\n") catch return "ERROR: write failed";
+
+    log.info("saved template '{s}' to {s}", .{ name, path });
+    return "OK";
+}
+
+/// Load a named template and create a new workspace from it.
+/// Returns the new workspace UUID string, or an error.
+pub fn loadTemplate(tab_manager: *TabManager, name: []const u8) []const u8 {
+    if (!isValidTemplateName(name)) return "ERROR: invalid template name";
+
+    const dir = getTemplateDir();
+    var path_buf: [384]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ dir, name }) catch
+        return "ERROR: template name too long";
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch
+        return "ERROR: template not found";
+    defer file.close();
+
+    var buf: [32768]u8 = undefined;
+    const n = file.read(&buf) catch return "ERROR: cannot read template";
+    if (n == 0) return "ERROR: empty template file";
+    const json = buf[0..n];
+
+    // Parse title
+    const title = extractJsonString(json, "title");
+
+    // Parse tree
+    const tree_key_pos = std.mem.indexOf(u8, json, "\"tree\":") orelse return "ERROR: template has no tree";
+    var tpos = tree_key_pos + 7;
+    while (tpos < json.len and (json[tpos] == ' ' or json[tpos] == '\n' or json[tpos] == '\t')) : (tpos += 1) {}
+    if (tpos >= json.len or json[tpos] != '{') return "ERROR: invalid tree in template";
+
+    const tree_end = findMatchingBrace(json, tpos) orelse return "ERROR: malformed tree JSON";
+    const tree_json = json[tpos .. tree_end + 1];
+
+    // Create workspace (new UUID)
+    const ws = tab_manager.createWorkspace() catch return "ERROR: failed to create workspace";
+
+    if (title) |t| {
+        if (t.len > 0) ws.setTitle(t);
+    }
+
+    // Restore tree from template (no dtach paths → fresh shells in saved CWDs)
+    const root_idx = restoreTreeNode(tree_json, ws, tab_manager.allocator) catch return "ERROR: failed to restore template layout";
+    ws.split_tree.root = root_idx;
+    ws.split_tree.focused = ws.split_tree.firstLeafFromRoot();
+
+    // Add root widget to workspace container
+    const root_widget = ws.split_tree.getNodeWidget(root_idx);
+    cc.c.gtk_widget_set_vexpand(root_widget, 1);
+    cc.c.gtk_widget_set_hexpand(root_widget, 1);
+    cc.c.gtk_box_append(ws.container, root_widget);
+
+    log.info("loaded template '{s}', created workspace {s}", .{ name, uuid.asSlice(&ws.id) });
+
+    // Return the workspace UUID
+    @memcpy(load_result_buf[0..36], uuid.asSlice(&ws.id));
+    return load_result_buf[0..36];
+}
+
+var load_result_buf: [36]u8 = undefined;
+
+/// List available template names.
+/// Returns newline-separated names (without .json extension), or empty string.
+pub fn listTemplates() []const u8 {
+    const dir_path = getTemplateDir();
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return "";
+    defer dir.close();
+
+    var pos: usize = 0;
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const name = entry.name[0 .. entry.name.len - 5]; // strip .json
+        if (name.len == 0) continue;
+
+        if (pos > 0 and pos < list_buf.len) {
+            list_buf[pos] = '\n';
+            pos += 1;
+        }
+        const copy_len = @min(name.len, list_buf.len - pos);
+        if (copy_len == 0) break;
+        @memcpy(list_buf[pos..][0..copy_len], name[0..copy_len]);
+        pos += copy_len;
+    }
+
+    return list_buf[0..pos];
+}
+
+var list_buf: [4096]u8 = undefined;
+
+fn ensureTemplateDir(dir: []const u8) void {
+    // Create the full path including parents
+    // ~/.config may not exist, ~/.config/cmux may not exist, etc.
+    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+        error.PathAlreadyExists => return,
+        else => {
+            // Try creating parent directories
+            if (posix.getenv("HOME")) |home| {
+                var parent_buf: [256]u8 = undefined;
+                const config = std.fmt.bufPrint(&parent_buf, "{s}/.config", .{home}) catch return;
+                std.fs.makeDirAbsolute(config) catch |e| switch (e) {
+                    error.PathAlreadyExists => {},
+                    else => return,
+                };
+                const cmux = std.fmt.bufPrint(&parent_buf, "{s}/.config/cmux", .{home}) catch return;
+                std.fs.makeDirAbsolute(cmux) catch |e| switch (e) {
+                    error.PathAlreadyExists => {},
+                    else => return,
+                };
+                std.fs.makeDirAbsolute(dir) catch {};
+            }
+        },
+    };
 }
 
 // ──────────────────────────────────────────────────────────

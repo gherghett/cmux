@@ -67,23 +67,19 @@ else
     check 1 "CMUX_WORKSPACE_ID valid in dtach after restart (env capture failed)"
 fi
 
-# --- Clean shutdown (no GLib-CRITICAL) ---
+# --- Clean shutdown (no warnings) ---
 stop_cmux
+check_stderr_clean
+
+# Also test a fresh start+split+close cycle for warnings
 full_cleanup
 start_xvfb
-
-DISPLAY=:99 "$PROJECT_DIR/zig-out/bin/cmux" >/dev/null 2>/tmp/cmux-stderr-$$ &
-sleep 3
-$CLI ping >/dev/null 2>&1
+start_cmux
 $CLI new_workspace >/dev/null 2>&1
 $CLI new_split h >/dev/null 2>&1
 sleep 1
-kill "$(pgrep -f "zig-out/bin/cmux" | head -1)" 2>/dev/null
-sleep 3
-
-GLIB_ERRORS=$(grep -c "GLib-CRITICAL\|Gtk-CRITICAL" /tmp/cmux-stderr-$$ 2>/dev/null)
-[ "${GLIB_ERRORS:-0}" = "0" ]; check $? "no GLib/Gtk CRITICAL on shutdown"
-rm -f /tmp/cmux-stderr-$$
+stop_cmux
+check_stderr_clean
 
 full_cleanup
 print_result

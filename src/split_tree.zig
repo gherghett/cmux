@@ -224,18 +224,22 @@ pub const SplitTree = struct {
         const grandparent_idx = self.parents.items[parent_idx];
         self.parents.items[sibling_idx] = grandparent_idx;
 
-        // Get widget refs BEFORE freeing the pane (use-after-free prevention)
+        // Get widget refs BEFORE freeing the pane
         const closed_widget = self.nodeWidget(idx);
         const old_paned = parent.paned;
 
-        // Clean up the closed pane. Kill dtach if user-initiated.
-        if (kill_dtach) self.nodes.items[idx].leaf.pane.close() else self.nodes.items[idx].leaf.pane.deinit();
-        self.nodes.items[idx] = .dead; // mark freed — prevents use-after-free in deferred callbacks
+        // Remove from GtkPaned BEFORE freeing the pane. This prevents
+        // "Error finding last focus widget of GtkPaned" — GTK tracks focus
+        // on child widgets, and removing a destroyed widget confuses it.
         if (c.gtk_paned_get_start_child(old_paned) == closed_widget) {
             c.gtk_paned_set_start_child(old_paned, null);
         } else {
             c.gtk_paned_set_end_child(old_paned, null);
         }
+
+        // Now safe to free the pane. Kill dtach if user-initiated.
+        if (kill_dtach) self.nodes.items[idx].leaf.pane.close() else self.nodes.items[idx].leaf.pane.deinit();
+        self.nodes.items[idx] = .dead;
 
         // Update tree structure: sibling replaces parent in the tree.
         // The old GtkPaned stays in the widget hierarchy as a pass-through

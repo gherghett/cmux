@@ -51,8 +51,8 @@ grep -q '"tree":' "$CMUX_DIR/session.json" 2>/dev/null; check $? "tree structure
 
 # Clean shutdown — count spawns by checking dtach process count (not log)
 stop_cmux
+check_stderr_clean
 DTACH_LEFT=$(ps aux | grep -E "dtach.*(cmux-dtach|/cmux/dtach)" | grep -v grep | wc -l)
-# Should be a reasonable number (we had 3 panes across 2 workspaces)
 [ "$DTACH_LEFT" -le 10 ] 2>/dev/null; check $? "no excessive dtach after session test ($DTACH_LEFT remaining)"
 
 full_cleanup
