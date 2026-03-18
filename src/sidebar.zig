@@ -187,7 +187,12 @@ pub const Sidebar = struct {
         // Indicator
         const ind = getIndicator(ws.claude_status);
         c.gtk_label_set_text(sb.indicator_label, ind.text orelse "");
-        // TODO: CSS class switching for colors
+        // Apply CSS class for indicator color (blue for unread, orange for attention)
+        c.gtk_widget_remove_css_class(asWidget(sb.indicator_label), "accent");
+        c.gtk_widget_remove_css_class(asWidget(sb.indicator_label), "warning");
+        if (ind.css_class) |cls| {
+            c.gtk_widget_add_css_class(asWidget(sb.indicator_label), cls);
+        }
 
         // Title
         var title_buf: [257]u8 = undefined;
