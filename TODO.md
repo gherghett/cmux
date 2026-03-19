@@ -23,6 +23,10 @@ A workspace is a live instance (vert-tab + split tree + panes with dtach session
 - [ ] **`list-templates`** — list available templates. Socket protocol: `list_templates → name per line`.
 - [ ] **Close workspace kills processes** — already works (killDtach on all panes). Document this as the expected behavior.
 
+### Pane tabs (multiple terminals per pane)
+
+- [ ] **Pane tabs are broken** — `Ctrl+Shift+N` creates a new VTE terminal tab within a pane, but all tabs share one `dtach_path` on the Pane struct. The second tab overwrites the first's dtach socket path, and the static `env_bufs`/`env_ptrs` get overwritten before VTE's async spawn completes. Result: tabs appear to share the same terminal or show stale content. Fix: move `dtach_path` to the Tab struct, give each tab its own dtach session, and update session save/restore to serialize per-tab dtach paths. Until fixed, `Ctrl+Shift+N` should be disabled or the feature removed.
+
 ### Future — workspace operations
 
 - [ ] **Move pane between workspaces** — detach a pane's dtach socket from one workspace's split tree, reattach in another. The process keeps running. dtach makes this possible.
