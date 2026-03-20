@@ -255,9 +255,26 @@ pub const Pane = struct {
         );
         if (page_num < 0) return error.NotebookAppendFailed;
 
-        // Show tabs when we have 2+
+        // Show tab bar when we have 2+ tabs. Freeze the parent GtkPaned
+        // position so the tab bar appearing doesn't rebalance the split.
         const n_pages = c.gtk_notebook_get_n_pages(self.notebook);
-        c.gtk_notebook_set_show_tabs(self.notebook, if (n_pages > 1) 1 else 0);
+        if (n_pages > 1 and c.gtk_notebook_get_show_tabs(self.notebook) == 0) {
+            const parent = c.gtk_widget_get_parent(asWidget(self.notebook));
+            var saved_pos: c_int = -1;
+            if (parent != null and c.g_type_check_instance_is_a(
+                @ptrCast(@alignCast(parent.?)),
+                c.gtk_paned_get_type(),
+            ) != 0) {
+                const as_paned: *c.GtkPaned = @ptrCast(@alignCast(parent.?));
+                saved_pos = c.gtk_paned_get_position(as_paned);
+                c.gtk_notebook_set_show_tabs(self.notebook, 1);
+                c.gtk_paned_set_position(as_paned, saved_pos);
+            } else {
+                c.gtk_notebook_set_show_tabs(self.notebook, 1);
+            }
+        } else {
+            c.gtk_notebook_set_show_tabs(self.notebook, if (n_pages > 1) 1 else 0);
+        }
 
         // Store tab — must be in self.tabs before spawning so memory is stable
         // for VTE's async callback
