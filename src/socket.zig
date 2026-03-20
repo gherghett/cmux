@@ -277,6 +277,8 @@ pub const SocketServer = struct {
         if (std.mem.eql(u8, cmd, "load_template")) return self.cmdLoadTemplate(args);
         if (std.mem.eql(u8, cmd, "list_templates")) return session.listTemplates();
         if (std.mem.eql(u8, cmd, "report_process")) return self.cmdReportProcess(args);
+        if (std.mem.eql(u8, cmd, "new_tab")) return self.cmdNewTab();
+        if (std.mem.eql(u8, cmd, "close_tab")) return self.cmdCloseTab();
         return "ERROR: unknown command";
     }
 
@@ -665,10 +667,10 @@ pub const SocketServer = struct {
             }
         }
 
-        // Try to find the exact pane by surface ID
+        // Try to find the exact pane tab by surface ID
         if (surface_id) |sid| {
             if (self.tab_manager.findSurface(&sid)) |found| {
-                found.pane.pushProcessHistory(proc_name);
+                found.tab.pushProcessHistory(proc_name);
                 return "OK";
             }
         }
@@ -694,6 +696,23 @@ pub const SocketServer = struct {
         const result = session.loadTemplate(self.tab_manager, name);
         if (self.tab_manager.on_change) |cb| cb(self.tab_manager.on_change_data);
         return result;
+    }
+
+    fn cmdNewTab(self: *SocketServer) []const u8 {
+        const ws = self.tab_manager.current() orelse return "ERROR: no workspace";
+        const pane = ws.split_tree.focusedPane() orelse return "ERROR: no focused pane";
+        const cwd = pane.getCwd();
+        _ = pane.addTab(cwd) catch return "ERROR: failed to create tab";
+        return "OK";
+    }
+
+    fn cmdCloseTab(self: *SocketServer) []const u8 {
+        const ws = self.tab_manager.current() orelse return "ERROR: no workspace";
+        const pane = ws.split_tree.focusedPane() orelse return "ERROR: no focused pane";
+        if (pane.currentTab()) |tab| {
+            pane.closeTab(tab.terminal);
+        }
+        return "OK";
     }
 };
 

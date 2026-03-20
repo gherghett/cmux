@@ -302,8 +302,9 @@ pub const Sidebar = struct {
             }
         }
 
-        // 2. Check history frequency
-        const total = pane.proc_history_count;
+        // 2. Check history frequency (on current tab)
+        const tab = pane.currentTab() orelse return null;
+        const total = tab.proc_history_count;
         if (total == 0) return null;
 
         var best_icon: ?ProcessIcon = null;
@@ -312,10 +313,10 @@ pub const Sidebar = struct {
         for (icon_map) |entry| {
             var count: u8 = 0;
             for (0..total) |i| {
-                const idx = (pane.proc_history_idx + 16 - 1 - i) % 16;
-                const plen = pane.proc_history_lens[idx];
+                const idx = (tab.proc_history_idx + 16 - 1 - i) % 16;
+                const plen = tab.proc_history_lens[idx];
                 if (plen > 0 and plen == entry.name.len and
-                    std.mem.eql(u8, pane.proc_history[idx][0..plen], entry.name))
+                    std.mem.eql(u8, tab.proc_history[idx][0..plen], entry.name))
                 {
                     count += 1;
                 }

@@ -126,19 +126,24 @@ fn writeTreeNode(w: anytype, tree: *const SplitTree, idx: SplitTree.NodeIndex, s
     switch (tree.nodes.items[idx]) {
         .dead => return,
         .leaf => |leaf| {
-            w.writeAll("{ ") catch return;
-            if (!skip_dtach) {
-                w.writeAll("\"dtach\": \"") catch return;
-                if (leaf.pane.dtach_path_len > 0) {
-                    w.writeAll(leaf.pane.dtach_path[0..leaf.pane.dtach_path_len]) catch return;
+            w.writeAll("{ \"tabs\": [") catch return;
+            for (leaf.pane.tabs.items, 0..) |*tab, ti| {
+                if (ti > 0) w.writeAll(", ") catch return;
+                w.writeAll("{ ") catch return;
+                if (!skip_dtach) {
+                    w.writeAll("\"dtach\": \"") catch return;
+                    if (tab.dtach_path_len > 0) {
+                        w.writeAll(tab.dtach_path[0..tab.dtach_path_len]) catch return;
+                    }
+                    w.writeAll("\", ") catch return;
                 }
-                w.writeAll("\", ") catch return;
+                w.writeAll("\"cwd\": \"") catch return;
+                if (tab.getCwd()) |cwd_ptr| {
+                    writeJsonEscaped(w, std.mem.span(cwd_ptr));
+                }
+                w.writeAll("\" }") catch return;
             }
-            w.writeAll("\"cwd\": \"") catch return;
-            if (leaf.pane.getCwd()) |cwd_ptr| {
-                writeJsonEscaped(w, std.mem.span(cwd_ptr));
-            }
-            w.writeAll("\" }") catch return;
+            w.writeAll("] }") catch return;
         },
         .split => |s| {
             w.writeAll("{ \"split\": \"") catch return;
@@ -487,20 +492,7 @@ fn restoreTreeNode(
         const split_idx = try ws.split_tree.addSplit(direction, paned, first_idx, second_idx, SplitTree.INVALID);
         return split_idx;
     } else {
-        // ── Leaf node ──
-        const dtach_path = extractJsonString(node_json, "dtach") orelse "";
-        const cwd_str = extractJsonString(node_json, "cwd") orelse "";
-
-        const dtach: ?[]const u8 = if (dtach_path.len > 0 and socketAlive(dtach_path)) dtach_path else null;
-
-        var cwd_z: [256:0]u8 = undefined;
-        const cwd: ?[*:0]const u8 = if (dtach == null and cwd_str.len > 0) blk: {
-            const cl = @min(cwd_str.len, 255);
-            @memcpy(cwd_z[0..cl], cwd_str[0..cl]);
-            cwd_z[cl] = 0;
-            break :blk cwd_z[0..cl :0];
-        } else null;
-
+        // ── Leaf node (contains "tabs": [...]) ──
         const pane = try Pane.init(allocator, ws.id, ws.socket_path);
         pane.on_empty = Workspace.getOnPaneEmpty();
         pane.on_empty_ctx = ws;
@@ -511,7 +503,45 @@ fn restoreTreeNode(
 
         const leaf_idx = try ws.split_tree.addLeaf(pane, SplitTree.INVALID);
         pane.node_index = leaf_idx;
-        _ = try pane.addTabDtach(cwd, dtach);
+
+        // Parse tabs array: { "tabs": [{ "dtach": "...", "cwd": "..." }, ...] }
+        if (std.mem.indexOf(u8, node_json, "\"tabs\":")) |tabs_key| {
+            var tpos = tabs_key + 7;
+            while (tpos < node_json.len and node_json[tpos] != '[') : (tpos += 1) {}
+            if (tpos < node_json.len) {
+                tpos += 1; // skip '['
+                // Walk through tab objects in the array
+                while (tpos < node_json.len) {
+                    while (tpos < node_json.len and (node_json[tpos] == ' ' or node_json[tpos] == '\n' or node_json[tpos] == ',' or node_json[tpos] == '\t')) : (tpos += 1) {}
+                    if (tpos >= node_json.len or node_json[tpos] == ']') break;
+                    if (node_json[tpos] != '{') break;
+
+                    const tab_end = findMatchingBrace(node_json, tpos) orelse break;
+                    const tab_json = node_json[tpos .. tab_end + 1];
+
+                    const dtach_path = extractJsonString(tab_json, "dtach") orelse "";
+                    const cwd_str = extractJsonString(tab_json, "cwd") orelse "";
+
+                    const dtach: ?[]const u8 = if (dtach_path.len > 0 and socketAlive(dtach_path)) dtach_path else null;
+
+                    var cwd_z: [256:0]u8 = undefined;
+                    const cwd: ?[*:0]const u8 = if (dtach == null and cwd_str.len > 0) blk: {
+                        const cl = @min(cwd_str.len, 255);
+                        @memcpy(cwd_z[0..cl], cwd_str[0..cl]);
+                        cwd_z[cl] = 0;
+                        break :blk cwd_z[0..cl :0];
+                    } else null;
+
+                    _ = try pane.addTabDtach(cwd, dtach);
+                    tpos = tab_end + 1;
+                }
+            }
+        }
+
+        // If no tabs were created (empty or parse failure), add one default tab
+        if (pane.tabs.items.len == 0) {
+            _ = try pane.addTab(null);
+        }
 
         return leaf_idx;
     }

@@ -8,7 +8,8 @@ const runtime_dir = @import("runtime_dir.zig");
 const log = std.log.scoped(.pane);
 
 /// A Pane wraps a GtkNotebook containing one or more VteTerminal tabs.
-/// Each terminal tab has its own UUID, PTY, and shell process.
+/// Each terminal tab has its own UUID, PTY, shell process, dtach session,
+/// process history, and browser tab tracking.
 pub const Pane = struct {
     id: uuid.Uuid,
     notebook: *c.GtkNotebook,
@@ -16,11 +17,6 @@ pub const Pane = struct {
     allocator: std.mem.Allocator,
     workspace_id: uuid.Uuid,
     socket_path: []const u8,
-    /// dtach socket path for this pane's primary terminal
-    dtach_path: [128]u8 = undefined,
-    dtach_path_len: usize = 0,
-    /// True once the shell/dtach process has started (onSpawnComplete fired).
-    ready: bool = false,
 
     /// Index of this pane's node in the split tree (set after insertion).
     node_index: u16 = std.math.maxInt(u16),
@@ -37,26 +33,101 @@ pub const Pane = struct {
     on_title: ?*const fn (title: [*:0]const u8, ctx: ?*anyopaque) void = null,
     on_title_ctx: ?*anyopaque = null,
 
-    browser_tabs: [16]?BrowserTab = [_]?BrowserTab{null} ** 16,
-    browser_tab_box: ?*c.GtkBox = null, // container for browser tab buttons in overlay
-
-    /// Cached dtach master PID — avoids scanning all of /proc on every refresh.
-    dtach_master_pid: std.c.pid_t = 0,
-    /// Cached leaf (deepest child) PID + timestamp. Expires after 1 second.
-    cached_leaf_pid: std.c.pid_t = 0,
-    cached_leaf_time: i64 = 0,
-
-    /// Ring buffer of recent distinct processes reported via shell integration.
-    proc_history: [16][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 16,
-    proc_history_lens: [16]u8 = [_]u8{0} ** 16,
-    proc_history_idx: u8 = 0,
-    proc_history_count: u8 = 0,
-
     pub const Tab = struct {
         id: uuid.Uuid,
         terminal: *c.VteTerminal,
         label: *c.GtkLabel,
         overlay: *c.GtkOverlay,
+
+        /// dtach socket path for this tab's terminal
+        dtach_path: [128]u8 = undefined,
+        dtach_path_len: usize = 0,
+
+        /// True once the shell/dtach process has started (onSpawnComplete fired).
+        ready: bool = false,
+
+        /// Cached dtach master PID — avoids scanning all of /proc on every refresh.
+        dtach_master_pid: std.c.pid_t = 0,
+        /// Cached leaf (deepest child) PID + timestamp. Expires after 1 second.
+        cached_leaf_pid: std.c.pid_t = 0,
+        cached_leaf_time: i64 = 0,
+
+        /// Ring buffer of recent distinct processes reported via shell integration.
+        proc_history: [16][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 16,
+        proc_history_lens: [16]u8 = [_]u8{0} ** 16,
+        proc_history_idx: u8 = 0,
+        proc_history_count: u8 = 0,
+
+        browser_tabs: [16]?BrowserTab = [_]?BrowserTab{null} ** 16,
+        browser_tab_box: ?*c.GtkBox = null, // container for browser tab buttons in overlay
+
+        /// Per-tab CMUX_* env var storage (8 vars x 128 bytes)
+        cmux_env_bufs: [8][128]u8 = undefined,
+        cmux_env_ptrs: [264:null]?[*:0]const u8 = undefined, // parent env + our vars
+
+        /// Push a process name into the ring buffer (called from report_process socket command).
+        pub fn pushProcessHistory(self: *Tab, name: []const u8) void {
+            if (name.len == 0) return;
+            const len = @min(name.len, 31);
+            @memcpy(self.proc_history[self.proc_history_idx][0..len], name[0..len]);
+            self.proc_history_lens[self.proc_history_idx] = @intCast(len);
+            self.proc_history_idx = (self.proc_history_idx + 1) % 16;
+            if (self.proc_history_count < 16) self.proc_history_count += 1;
+        }
+
+        /// Check if a process name appeared in recent history.
+        pub fn hasRecentProcess(self: *const Tab, name: []const u8) bool {
+            for (0..self.proc_history_count) |i| {
+                const idx = (self.proc_history_idx + 16 - 1 - i) % 16;
+                const plen = self.proc_history_lens[idx];
+                if (plen > 0 and std.mem.eql(u8, self.proc_history[idx][0..plen], name)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        fn getLeafPid(self: *Tab) ?std.c.pid_t {
+            if (self.dtach_path_len == 0) return null;
+
+            // Return cached leaf if fresh (within 1 second)
+            const now = std.time.milliTimestamp();
+            if (self.cached_leaf_pid > 0 and (now - self.cached_leaf_time) < 1000) {
+                return self.cached_leaf_pid;
+            }
+
+            // Find dtach master PID (cached, rarely changes)
+            if (self.dtach_master_pid <= 0) {
+                const dtach_path = self.dtach_path[0..self.dtach_path_len];
+                self.dtach_master_pid = findDtachPidBySocket(dtach_path) orelse return null;
+            }
+
+            // Walk children (cheap — just a few /proc reads down the tree)
+            const leaf = findDeepestChild(self.dtach_master_pid);
+            if (leaf <= 0) {
+                // dtach might have died, clear cache
+                self.dtach_master_pid = 0;
+                self.cached_leaf_pid = 0;
+                return null;
+            }
+
+            self.cached_leaf_pid = leaf;
+            self.cached_leaf_time = now;
+            return leaf;
+        }
+
+        /// Get the CWD of the innermost foreground process via /proc.
+        pub fn getCwd(self: *Tab) ?[*:0]const u8 {
+            const leaf_pid = self.getLeafPid() orelse return null;
+            return readProcCwd(leaf_pid);
+        }
+
+        /// Get the name of the active (deepest child) process in this tab.
+        /// Returns the process name (e.g. "claude", "npm", "bash") or null.
+        pub fn getActiveProcessName(self: *Tab) ?[]const u8 {
+            const leaf_pid = self.getLeafPid() orelse return null;
+            return readProcComm(leaf_pid);
+        }
     };
 
     pub const BrowserTab = struct {
@@ -99,13 +170,14 @@ pub const Pane = struct {
     /// Pumps the GTK main loop so async spawn can complete.
     /// Times out after ~2 seconds to avoid deadlock.
     pub fn waitReady(self: *Pane) void {
+        const tab = self.currentTab() orelse return;
         var attempts: u32 = 0;
-        while (!self.ready and attempts < 200) : (attempts += 1) {
+        while (!tab.ready and attempts < 200) : (attempts += 1) {
             // Pump the GTK main loop so VTE's async spawn can complete
             _ = c.g_main_context_iteration(null, 0);
             std.time.sleep(10_000_000); // 10ms
         }
-        if (!self.ready) {
+        if (!tab.ready) {
             log.warn("pane spawn timed out after 2 seconds", .{});
         }
     }
@@ -120,21 +192,21 @@ pub const Pane = struct {
         self.allocator.destroy(self);
     }
 
-    /// Kill the dtach process and clean up the socket.
+    /// Kill the dtach process for ALL tabs and clean up their sockets.
     /// Used when the USER explicitly closes a pane or workspace.
     pub fn killDtach(self: *Pane) void {
-        if (self.dtach_path_len > 0) {
-            const path = self.dtach_path[0..self.dtach_path_len];
-            log.info("killing dtach at {s}", .{path});
+        for (self.tabs.items) |*tab| {
+            if (tab.dtach_path_len > 0) {
+                const path = tab.dtach_path[0..tab.dtach_path_len];
+                log.info("killing dtach at {s}", .{path});
 
-            // Remove the socket file first — prevents dtach from accepting
-            // new connections. Then send exit to the terminal which causes
-            // the shell to exit, making dtach exit naturally.
-            std.fs.deleteFileAbsolute(path) catch {};
+                // Remove the socket file first — prevents dtach from accepting
+                // new connections. Then send exit to the terminal which causes
+                // the shell to exit, making dtach exit naturally.
+                std.fs.deleteFileAbsolute(path) catch {};
 
-            // Feed "exit\n" to our VTE terminal to kill the shell inside dtach
-            if (self.currentTerminal()) |term| {
-                c.vte_terminal_feed_child(term, "exit\n", 5);
+                // Feed "exit\n" to this tab's VTE terminal to kill the shell inside dtach
+                c.vte_terminal_feed_child(tab.terminal, "exit\n", 5);
             }
         }
     }
@@ -187,7 +259,8 @@ pub const Pane = struct {
         const n_pages = c.gtk_notebook_get_n_pages(self.notebook);
         c.gtk_notebook_set_show_tabs(self.notebook, if (n_pages > 1) 1 else 0);
 
-        // Store tab
+        // Store tab — must be in self.tabs before spawning so memory is stable
+        // for VTE's async callback
         try self.tabs.append(.{
             .id = tab_id,
             .terminal = terminal,
@@ -232,7 +305,7 @@ pub const Pane = struct {
         setupUrlMatching(terminal, self);
 
         // Spawn shell (or reattach to existing dtach session)
-        self.spawnShellDtach(terminal, cwd, dtach_socket);
+        self.spawnShellDtach(tab, terminal, cwd, dtach_socket);
 
         // Make new tab visible and focused
         c.gtk_notebook_set_current_page(self.notebook, page_num);
@@ -262,11 +335,7 @@ pub const Pane = struct {
     /// Spawn a shell via dtach for process persistence.
     /// If dtach_socket is provided, reattach to existing session.
     /// Otherwise create a new dtach session.
-    fn spawnShell(self: *Pane, terminal: *c.VteTerminal, cwd: ?[*:0]const u8) void {
-        self.spawnShellDtach(terminal, cwd, null);
-    }
-
-    fn spawnShellDtach(self: *Pane, terminal: *c.VteTerminal, cwd: ?[*:0]const u8, existing_dtach: ?[]const u8) void {
+    fn spawnShellDtach(self: *Pane, tab: *Tab, terminal: *c.VteTerminal, cwd: ?[*:0]const u8, existing_dtach: ?[]const u8) void {
         // Initialize shell path once
         if (!shell_path_initialized) {
             const shell_env = std.posix.getenv("SHELL") orelse "/bin/bash";
@@ -279,16 +348,11 @@ pub const Pane = struct {
         const effective_cwd = cwd orelse getDefaultCwd();
 
         // Set CMUX_* env vars
-        const tab = self.currentTab();
-        const surface_id = if (tab) |t| uuid.asSlice(&t.id) else "unknown";
+        const surface_id = uuid.asSlice(&tab.id);
         const workspace_id = uuid.asSlice(&self.workspace_id);
 
         // Prepend bin to PATH once (process-level, safe to share)
         prependBinToPath();
-
-        // Build per-terminal env array with CMUX_* vars.
-        // Must NOT use g_setenv (process-global — last pane wins).
-        buildEnv(surface_id, workspace_id, self.socket_path);
 
         // Build dtach socket path
         var dtach_sock: [128]u8 = undefined;
@@ -300,16 +364,19 @@ pub const Pane = struct {
             @memcpy(dtach_sock[0..dtach_sock_len], path[0..dtach_sock_len]);
             dtach_sock[dtach_sock_len] = 0;
         } else {
-            // Create new dtach session in runtime dir
-            const pane_id = uuid.asSlice(&self.id);
-            const dp = runtime_dir.dtachPath(&dtach_sock, pane_id);
+            // Create new dtach session in runtime dir (use TAB's UUID, not pane's)
+            const tab_id = uuid.asSlice(&tab.id);
+            const dp = runtime_dir.dtachPath(&dtach_sock, tab_id);
             dtach_sock_len = dp.len;
             dtach_sock[dtach_sock_len] = 0;
         }
 
-        // Store on pane for serialization
-        @memcpy(self.dtach_path[0..dtach_sock_len], dtach_sock[0..dtach_sock_len]);
-        self.dtach_path_len = dtach_sock_len;
+        // Store on tab for serialization
+        @memcpy(tab.dtach_path[0..dtach_sock_len], dtach_sock[0..dtach_sock_len]);
+        tab.dtach_path_len = dtach_sock_len;
+
+        // Build per-tab env array with CMUX_* vars into tab's own storage
+        buildEnv(tab, surface_id, workspace_id, self.socket_path);
 
         // Build command: dtach -A <socket> -Ez bash --rcfile <cmux-bash>
         // --rcfile tells bash to source our wrapper instead of ~/.bashrc.
@@ -331,7 +398,7 @@ pub const Pane = struct {
             c.VTE_PTY_DEFAULT,
             effective_cwd,
             @ptrCast(&argv),
-            @ptrCast(&env_ptrs), // per-terminal env
+            @ptrCast(&tab.cmux_env_ptrs), // per-tab env
             c.G_SPAWN_DEFAULT,
             null, null, null,
             -1,
@@ -401,34 +468,47 @@ pub const Pane = struct {
         _ = c.g_setenv("CMUX_SHELL_INTEGRATION_DIR", &init_dir_buf, 1);
     }
 
-    // Per-terminal environment array. Static buffers so they live long enough
-    // for VTE's async spawn to read them.
-    var env_bufs: [16][512]u8 = undefined;
-    var env_ptrs: [256:null]?[*:0]const u8 = undefined;
+    // Cached parent env pointers (shared across tabs — the parent env is the same).
+    // Populated once, then each tab copies from here into its own cmux_env_ptrs.
+    var parent_env_cache: [256]?[*:0]const u8 = undefined;
+    var parent_env_count: usize = 0;
+    var parent_env_initialized: bool = false;
 
-    fn buildEnv(surface_id: []const u8, workspace_id: []const u8, socket_path: []const u8) void {
-        var idx: usize = 0;
-        var buf_idx: usize = 0;
+    fn cacheParentEnv() void {
+        if (parent_env_initialized) return;
+        parent_env_initialized = true;
+        parent_env_count = 0;
 
-        // Copy parent env, skipping CMUX_* and TERM_PROGRAM (we'll add ours)
         const environ: ?[*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
         if (environ) |env| {
             var i: usize = 0;
             while (env[i]) |entry| : (i += 1) {
-                if (idx >= 240) break; // reserve space
+                if (parent_env_count >= 240) break; // reserve space for CMUX_* vars
                 const s = std.mem.span(entry);
                 // VTE requires every entry to contain '='
                 if (std.mem.indexOfScalar(u8, s, '=') == null) continue;
-                // Skip our vars (we'll re-add with correct per-terminal values)
+                // Skip our vars (we'll re-add with correct per-tab values)
                 if (std.mem.startsWith(u8, s, "CMUX_")) continue;
                 if (std.mem.startsWith(u8, s, "TERM_PROGRAM=")) continue;
-                env_ptrs[idx] = entry;
-                idx += 1;
+                parent_env_cache[parent_env_count] = entry;
+                parent_env_count += 1;
             }
         }
+    }
 
-        // Add CMUX_* vars using static buffers.
-        // CMUX_SHELL_INIT triggers auto-sourcing of shell integration on first prompt.
+    fn buildEnv(tab: *Tab, surface_id: []const u8, workspace_id: []const u8, socket_path: []const u8) void {
+        // Ensure parent env is cached
+        cacheParentEnv();
+
+        // Copy parent env pointers into tab's own array
+        var idx: usize = 0;
+        for (0..parent_env_count) |i| {
+            tab.cmux_env_ptrs[idx] = parent_env_cache[i];
+            idx += 1;
+        }
+
+        // Add CMUX_* vars using tab's own buffers.
+        var buf_idx: usize = 0;
         const vars = [_]struct { k: []const u8, v: []const u8 }{
             .{ .k = "CMUX_SURFACE_ID=", .v = surface_id },
             .{ .k = "CMUX_WORKSPACE_ID=", .v = workspace_id },
@@ -439,18 +519,18 @@ pub const Pane = struct {
         };
 
         for (vars) |kv| {
-            if (buf_idx >= env_bufs.len or idx >= 255) break;
+            if (buf_idx >= tab.cmux_env_bufs.len or idx >= 263) break;
             const total = kv.k.len + kv.v.len;
-            if (total >= env_bufs[buf_idx].len) continue;
-            @memcpy(env_bufs[buf_idx][0..kv.k.len], kv.k);
-            @memcpy(env_bufs[buf_idx][kv.k.len..][0..kv.v.len], kv.v);
-            env_bufs[buf_idx][total] = 0;
-            env_ptrs[idx] = env_bufs[buf_idx][0..total :0];
+            if (total >= tab.cmux_env_bufs[buf_idx].len) continue;
+            @memcpy(tab.cmux_env_bufs[buf_idx][0..kv.k.len], kv.k);
+            @memcpy(tab.cmux_env_bufs[buf_idx][kv.k.len..][0..kv.v.len], kv.v);
+            tab.cmux_env_bufs[buf_idx][total] = 0;
+            tab.cmux_env_ptrs[idx] = tab.cmux_env_bufs[buf_idx][0..total :0];
             idx += 1;
             buf_idx += 1;
         }
 
-        env_ptrs[idx] = null;
+        tab.cmux_env_ptrs[idx] = null;
     }
 
     /// Close a tab by finding the VteTerminal in the notebook.
@@ -502,13 +582,14 @@ pub const Pane = struct {
     /// Reattach the current terminal to an existing dtach session.
     /// Kills the auto-spawned shell and connects to the dtach socket.
     pub fn reattachDtach(self: *Pane, dtach_socket: []const u8) void {
-        const term = self.currentTerminal() orelse return;
+        const tab = self.currentTab() orelse return;
+        const term = tab.terminal;
 
-        // Store the dtach path
+        // Store the dtach path on the tab
         const dlen = @min(dtach_socket.len, 127);
-        @memcpy(self.dtach_path[0..dlen], dtach_socket[0..dlen]);
-        self.dtach_path[dlen] = 0;
-        self.dtach_path_len = dlen;
+        @memcpy(tab.dtach_path[0..dlen], dtach_socket[0..dlen]);
+        tab.dtach_path[dlen] = 0;
+        tab.dtach_path_len = dlen;
 
         // Feed a command to attach to the dtach socket
         // This replaces the current shell with dtach
@@ -540,168 +621,45 @@ pub const Pane = struct {
     }
 
     /// Get the CWD of the innermost foreground process via /proc.
-    ///
-    /// With dtach, VTE doesn't own the shell process — dtach daemonizes and
-    /// VTE's child exits immediately after attaching. So TIOCGPGRP on VTE's
-    /// PTY doesn't help. Instead we find the dtach master process by scanning
-    /// /proc for our stored socket path, then walk its children to find the
-    /// deepest (foreground) process.
+    /// Delegates to the current tab.
     pub fn getCwd(self: *Pane) ?[*:0]const u8 {
-        const leaf_pid = self.getLeafPid() orelse return null;
-        return readProcCwd(leaf_pid);
+        const tab = self.currentTab() orelse return null;
+        return tab.getCwd();
     }
 
     /// Get the name of the active (deepest child) process in this pane.
-    /// Returns the process name (e.g. "claude", "npm", "bash") or null.
+    /// Delegates to the current tab.
     pub fn getActiveProcessName(self: *Pane) ?[]const u8 {
-        const leaf_pid = self.getLeafPid() orelse return null;
-        return readProcComm(leaf_pid);
+        const tab = self.currentTab() orelse return null;
+        return tab.getActiveProcessName();
     }
 
-    /// Push a process name into the ring buffer (called from report_process socket command).
+    /// Push a process name into the current tab's ring buffer.
+    /// Delegates to the current tab.
     pub fn pushProcessHistory(self: *Pane, name: []const u8) void {
-        if (name.len == 0) return;
-        const len = @min(name.len, 31);
-        @memcpy(self.proc_history[self.proc_history_idx][0..len], name[0..len]);
-        self.proc_history_lens[self.proc_history_idx] = @intCast(len);
-        self.proc_history_idx = (self.proc_history_idx + 1) % 16;
-        if (self.proc_history_count < 16) self.proc_history_count += 1;
+        const tab = self.currentTab() orelse return;
+        tab.pushProcessHistory(name);
     }
 
-    /// Check if a process name appeared in recent history.
+    /// Check if a process name appeared in recent history of the current tab.
+    /// Delegates to the current tab.
     pub fn hasRecentProcess(self: *const Pane, name: []const u8) bool {
-        for (0..self.proc_history_count) |i| {
-            const idx = (self.proc_history_idx + 16 - 1 - i) % 16;
-            const plen = self.proc_history_lens[idx];
-            if (plen > 0 and std.mem.eql(u8, self.proc_history[idx][0..plen], name)) {
-                return true;
-            }
-        }
-        return false;
+        // currentTab needs mutable self for ArrayList access; cast away const
+        // (safe — we only read history fields)
+        const mself: *Pane = @constCast(self);
+        const tab = mself.currentTab() orelse return false;
+        return tab.hasRecentProcess(name);
     }
 
-    fn getLeafPid(self: *Pane) ?std.c.pid_t {
-        if (self.dtach_path_len == 0) return null;
-
-        // Return cached leaf if fresh (within 1 second)
-        const now = std.time.milliTimestamp();
-        if (self.cached_leaf_pid > 0 and (now - self.cached_leaf_time) < 1000) {
-            return self.cached_leaf_pid;
-        }
-
-        // Find dtach master PID (cached, rarely changes)
-        if (self.dtach_master_pid <= 0) {
-            const dtach_path = self.dtach_path[0..self.dtach_path_len];
-            self.dtach_master_pid = findDtachPidBySocket(dtach_path) orelse return null;
-        }
-
-        // Walk children (cheap — just a few /proc reads down the tree)
-        const leaf = findDeepestChild(self.dtach_master_pid);
-        if (leaf <= 0) {
-            // dtach might have died, clear cache
-            self.dtach_master_pid = 0;
-            self.cached_leaf_pid = 0;
-            return null;
-        }
-
-        self.cached_leaf_pid = leaf;
-        self.cached_leaf_time = now;
-        return leaf;
-    }
-
-    /// Find the dtach master process PID by scanning /proc for a process
-    /// whose cmdline contains our dtach socket path.
-    fn findDtachPidBySocket(socket_path: []const u8) ?std.c.pid_t {
-        var dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return null;
-        defer dir.close();
-
-        var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
-            // Only look at numeric directory names (PIDs)
-            const pid = std.fmt.parseInt(std.c.pid_t, entry.name, 10) catch continue;
-            if (pid <= 0) continue;
-
-            // Read /proc/<pid>/cmdline
-            var cmdline_path_buf: [32]u8 = undefined;
-            const cmdline_path = std.fmt.bufPrint(&cmdline_path_buf, "/proc/{d}/cmdline", .{pid}) catch continue;
-
-            const file = std.fs.openFileAbsolute(cmdline_path, .{}) catch continue;
-            defer file.close();
-
-            var cmdline_buf: [512]u8 = undefined;
-            const n = file.read(&cmdline_buf) catch continue;
-            if (n == 0) continue;
-
-            // cmdline is null-separated. Check if it contains "dtach" and our socket path.
-            const cmdline = cmdline_buf[0..n];
-            if (std.mem.indexOf(u8, cmdline, "dtach") == null) continue;
-            if (std.mem.indexOf(u8, cmdline, socket_path) != null) {
-                return pid;
+    /// Find a tab by its terminal pointer.
+    fn findTabByTerminal(self: *Pane, terminal: *c.VteTerminal) ?*Tab {
+        for (self.tabs.items, 0..) |_, i| {
+            if (self.tabs.items[i].terminal == terminal) {
+                return &self.tabs.items[i];
             }
         }
         return null;
     }
-
-    /// Walk /proc/<pid>/task/<pid>/children repeatedly to find the leaf process.
-    fn findDeepestChild(start_pid: std.c.pid_t) std.c.pid_t {
-        var pid = start_pid;
-        var depth: u8 = 0;
-        while (depth < 8) : (depth += 1) {
-            var children_path_buf: [64]u8 = undefined;
-            const children_path = std.fmt.bufPrint(
-                &children_path_buf,
-                "/proc/{d}/task/{d}/children",
-                .{ pid, pid },
-            ) catch break;
-
-            const file = std.fs.openFileAbsolute(children_path, .{}) catch break;
-            defer file.close();
-
-            var buf: [256]u8 = undefined;
-            const n = file.read(&buf) catch break;
-            if (n == 0) break; // no children — this is the leaf
-
-            // Parse first child PID (space-separated)
-            const content = std.mem.trim(u8, buf[0..n], " \n");
-            const first_space = std.mem.indexOfScalar(u8, content, ' ') orelse content.len;
-            const child_pid = std.fmt.parseInt(std.c.pid_t, content[0..first_space], 10) catch break;
-            if (child_pid <= 0) break;
-
-            pid = child_pid;
-        }
-        return pid;
-    }
-
-    /// Read /proc/<pid>/comm — the process name (e.g. "claude", "bash").
-    /// Returns a slice into a static buffer, or null.
-    fn readProcComm(pid: std.c.pid_t) ?[]const u8 {
-        var path_buf: [32]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return null;
-        const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-        defer file.close();
-        const n = file.read(&comm_buf) catch return null;
-        if (n == 0) return null;
-        // comm has a trailing newline
-        const name = std.mem.trim(u8, comm_buf[0..n], "\n ");
-        if (name.len == 0) return null;
-        return name;
-    }
-
-    var comm_buf: [64]u8 = undefined;
-
-    fn readProcCwd(pid: std.c.pid_t) ?[*:0]const u8 {
-        var proc_path_buf: [64]u8 = undefined;
-        const proc_path = std.fmt.bufPrint(&proc_path_buf, "/proc/{d}/cwd", .{pid}) catch return null;
-
-        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const link = std.fs.readLinkAbsolute(proc_path, &link_buf) catch return null;
-        const len = @min(link.len, cwd_buf.len - 1);
-        @memcpy(cwd_buf[0..len], link[0..len]);
-        cwd_buf[len] = 0;
-        return cwd_buf[0..len :0];
-    }
-
-    var cwd_buf: [4096:0]u8 = undefined;
 
     /// Focus this pane's current terminal
     pub fn focus(self: *Pane) void {
@@ -772,7 +730,7 @@ pub const Pane = struct {
         }
     }
 
-    fn openUrlAndTrack(url: []const u8, _: *c.VteTerminal, pane: ?*Pane) void {
+    fn openUrlAndTrack(url: []const u8, terminal: *c.VteTerminal, pane: ?*Pane) void {
         // Use CDP to open the URL: PUT /json/new?{url}
         // This creates a new tab AND returns the tab ID immediately.
         var cdp_url_buf: [2200]u8 = undefined;
@@ -817,7 +775,10 @@ pub const Pane = struct {
             const target_id = content[0..q2];
 
             log.info("CDP: opened tab {s} for {s}", .{ target_id, url });
-            if (pane) |p| storeBrowserTab(p, target_id, url);
+            if (pane) |p| {
+                const tab = p.findTabByTerminal(terminal) orelse p.currentTab();
+                if (tab) |t| storeBrowserTab(p, t, target_id, url);
+            }
         } else {
             log.info("CDP: no id in response, falling back", .{});
             fallbackOpen(url);
@@ -919,7 +880,8 @@ pub const Pane = struct {
                 if (ctx.pane) |pane| {
                     // Use the actual browser URL (after redirect) for display
                     const display_url = if (url_slice.len > 0) url_slice else ctx.url[0..ctx.url_len];
-                    storeBrowserTab(pane, id_slice, display_url);
+                    const tab = pane.findTabByTerminal(ctx.terminal) orelse pane.currentTab();
+                    if (tab) |t| storeBrowserTab(pane, t, id_slice, display_url);
                 }
 
                 std.heap.c_allocator.destroy(ctx);
@@ -970,14 +932,14 @@ pub const Pane = struct {
             const url_pos = std.mem.indexOfPos(u8, json, id_end, url_needle) orelse break;
             const url_start = url_pos + url_needle.len;
             const url_end = std.mem.indexOfScalarPos(u8, json, url_start, '"') orelse break;
-            const url = json[url_start..url_end];
+            const browser_url = json[url_start..url_end];
 
             const ilen = @min(id.len, 63);
             @memcpy(ids[count.*][0..ilen], id[0..ilen]);
             ids[count.*][ilen] = 0;
 
-            const ulen = @min(url.len, 255);
-            @memcpy(urls[count.*][0..ulen], url[0..ulen]);
+            const ulen = @min(browser_url.len, 255);
+            @memcpy(urls[count.*][0..ulen], browser_url[0..ulen]);
             urls[count.*][ulen] = 0;
 
             count.* += 1;
@@ -985,10 +947,11 @@ pub const Pane = struct {
         }
     }
 
-    fn storeBrowserTab(pane: *Pane, target_id: []const u8, url: []const u8) void {
+    fn storeBrowserTab(pane: *Pane, tab: *Tab, target_id: []const u8, url: []const u8) void {
+        _ = pane; // pane passed for future use; browser tabs are stored on tab
         // Find a free slot (or check for duplicate)
         var slot: ?usize = null;
-        for (pane.browser_tabs, 0..) |bt_opt, i| {
+        for (tab.browser_tabs, 0..) |bt_opt, i| {
             if (bt_opt) |bt| {
                 // Skip if already tracking this URL
                 if (std.mem.eql(u8, bt.url[0..bt.url_len], url[0..@min(url.len, 256)])) return;
@@ -1013,23 +976,21 @@ pub const Pane = struct {
         @memcpy(bt.url[0..url_len], url[0..url_len]);
         bt.url[url_len] = 0;
 
-        pane.browser_tabs[idx] = bt;
-        pane.rebuildBrowserButtons();
+        tab.browser_tabs[idx] = bt;
+        rebuildBrowserButtons(tab);
     }
 
     /// Rebuild the overlay button box from the browser_tabs list.
-    fn rebuildBrowserButtons(self: *Pane) void {
-        const tab = self.currentTab() orelse return;
-
+    fn rebuildBrowserButtons(tab: *Tab) void {
         // Remove old button box
-        if (self.browser_tab_box) |old_box| {
+        if (tab.browser_tab_box) |old_box| {
             c.gtk_overlay_remove_overlay(tab.overlay, asWidget(old_box));
-            self.browser_tab_box = null;
+            tab.browser_tab_box = null;
         }
 
         // Count active tabs
         var count: usize = 0;
-        for (self.browser_tabs) |bt_opt| {
+        for (tab.browser_tabs) |bt_opt| {
             if (bt_opt != null) count += 1;
         }
         if (count == 0) return;
@@ -1043,7 +1004,7 @@ pub const Pane = struct {
         c.gtk_widget_set_margin_end(asWidget(box), 8);
         c.gtk_widget_set_margin_bottom(asWidget(box), 8);
 
-        for (&self.browser_tabs) |*bt_opt| {
+        for (&tab.browser_tabs) |*bt_opt| {
             if (bt_opt.*) |*bt| {
                 var display_buf: [80]u8 = undefined;
                 const ulen = bt.url_len;
@@ -1082,14 +1043,17 @@ pub const Pane = struct {
         }
 
         c.gtk_overlay_add_overlay(tab.overlay, asWidget(box));
-        self.browser_tab_box = box;
+        tab.browser_tab_box = box;
     }
 
     /// Called from the periodic sidebar refresh to check if CDP tabs are still open.
     pub fn pollBrowserTabs(self: *Pane) void {
         var has_tabs = false;
-        for (self.browser_tabs) |bt_opt| {
-            if (bt_opt != null) { has_tabs = true; break; }
+        for (self.tabs.items) |*tab| {
+            for (tab.browser_tabs) |bt_opt| {
+                if (bt_opt != null) { has_tabs = true; break; }
+            }
+            if (has_tabs) break;
         }
         if (!has_tabs) return;
 
@@ -1111,21 +1075,22 @@ pub const Pane = struct {
         const n = file.read(&buf) catch return;
         const json = buf[0..n];
 
-        // Check each tracked tab — remove if not found in CDP response
-        var changed = false;
-        for (&self.browser_tabs) |*bt_opt| {
-            if (bt_opt.*) |bt| {
-                const tid = bt.target_id[0..bt.target_id_len];
-                if (std.mem.indexOf(u8, json, tid) == null) {
-                    // Tab no longer exists in browser
-                    log.info("CDP: tab {s} closed in browser, removing", .{tid});
-                    bt_opt.* = null;
-                    changed = true;
+        // Check each tracked tab on each pane tab — remove if not found in CDP response
+        for (self.tabs.items) |*tab| {
+            var changed = false;
+            for (&tab.browser_tabs) |*bt_opt| {
+                if (bt_opt.*) |bt| {
+                    const tid = bt.target_id[0..bt.target_id_len];
+                    if (std.mem.indexOf(u8, json, tid) == null) {
+                        // Tab no longer exists in browser
+                        log.info("CDP: tab {s} closed in browser, removing", .{tid});
+                        bt_opt.* = null;
+                        changed = true;
+                    }
                 }
             }
+            if (changed) rebuildBrowserButtons(tab);
         }
-
-        if (changed) self.rebuildBrowserButtons();
     }
 
     fn onBrowserTabClick(button: *c.GtkButton, _: ?*anyopaque) callconv(.C) void {
@@ -1155,6 +1120,102 @@ pub const Pane = struct {
         }
     }
 
+    // --- /proc helpers (module-level, shared across tabs) ---
+
+    /// Find the dtach master process PID by scanning /proc for a process
+    /// whose cmdline contains our dtach socket path.
+    fn findDtachPidBySocket(socket_path: []const u8) ?std.c.pid_t {
+        var dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return null;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            // Only look at numeric directory names (PIDs)
+            const pid = std.fmt.parseInt(std.c.pid_t, entry.name, 10) catch continue;
+            if (pid <= 0) continue;
+
+            // Read /proc/<pid>/cmdline
+            var cmdline_path_buf: [32]u8 = undefined;
+            const cmdline_path = std.fmt.bufPrint(&cmdline_path_buf, "/proc/{d}/cmdline", .{pid}) catch continue;
+
+            const file = std.fs.openFileAbsolute(cmdline_path, .{}) catch continue;
+            defer file.close();
+
+            var cmdline_buf: [512]u8 = undefined;
+            const n = file.read(&cmdline_buf) catch continue;
+            if (n == 0) continue;
+
+            // cmdline is null-separated. Check if it contains "dtach" and our socket path.
+            const cmdline = cmdline_buf[0..n];
+            if (std.mem.indexOf(u8, cmdline, "dtach") == null) continue;
+            if (std.mem.indexOf(u8, cmdline, socket_path) != null) {
+                return pid;
+            }
+        }
+        return null;
+    }
+
+    /// Walk /proc/<pid>/task/<pid>/children repeatedly to find the leaf process.
+    fn findDeepestChild(start_pid: std.c.pid_t) std.c.pid_t {
+        var pid = start_pid;
+        var depth: u8 = 0;
+        while (depth < 8) : (depth += 1) {
+            var children_path_buf: [64]u8 = undefined;
+            const children_path = std.fmt.bufPrint(
+                &children_path_buf,
+                "/proc/{d}/task/{d}/children",
+                .{ pid, pid },
+            ) catch break;
+
+            const file = std.fs.openFileAbsolute(children_path, .{}) catch break;
+            defer file.close();
+
+            var buf: [256]u8 = undefined;
+            const n = file.read(&buf) catch break;
+            if (n == 0) break; // no children — this is the leaf
+
+            // Parse first child PID (space-separated)
+            const content = std.mem.trim(u8, buf[0..n], " \n");
+            const first_space = std.mem.indexOfScalar(u8, content, ' ') orelse content.len;
+            const child_pid = std.fmt.parseInt(std.c.pid_t, content[0..first_space], 10) catch break;
+            if (child_pid <= 0) break;
+
+            pid = child_pid;
+        }
+        return pid;
+    }
+
+    /// Read /proc/<pid>/comm — the process name (e.g. "claude", "bash").
+    /// Returns a slice into a static buffer, or null.
+    fn readProcComm(pid: std.c.pid_t) ?[]const u8 {
+        var path_buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return null;
+        const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+        defer file.close();
+        const n = file.read(&comm_buf) catch return null;
+        if (n == 0) return null;
+        // comm has a trailing newline
+        const name = std.mem.trim(u8, comm_buf[0..n], "\n ");
+        if (name.len == 0) return null;
+        return name;
+    }
+
+    var comm_buf: [64]u8 = undefined;
+
+    fn readProcCwd(pid: std.c.pid_t) ?[*:0]const u8 {
+        var proc_path_buf: [64]u8 = undefined;
+        const proc_path = std.fmt.bufPrint(&proc_path_buf, "/proc/{d}/cwd", .{pid}) catch return null;
+
+        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const link = std.fs.readLinkAbsolute(proc_path, &link_buf) catch return null;
+        const len = @min(link.len, cwd_buf.len - 1);
+        @memcpy(cwd_buf[0..len], link[0..len]);
+        cwd_buf[len] = 0;
+        return cwd_buf[0..len :0];
+    }
+
+    var cwd_buf: [4096:0]u8 = undefined;
+
     // --- Signal handlers ---
 
     fn onFocusEnter(_: *c.GtkEventControllerFocus, pane: *Pane) callconv(.C) void {
@@ -1164,7 +1225,7 @@ pub const Pane = struct {
     }
 
     fn onSpawnComplete(
-        _: *c.VteTerminal,
+        terminal: *c.VteTerminal,
         pid: c.GPid,
         err: ?*c.GError,
         user_data: ?*anyopaque,
@@ -1176,7 +1237,10 @@ pub const Pane = struct {
         }
         if (user_data) |ud| {
             const pane: *Pane = @ptrCast(@alignCast(ud));
-            pane.ready = true;
+            // Find the tab that owns this terminal and mark it ready
+            if (pane.findTabByTerminal(terminal)) |tab| {
+                tab.ready = true;
+            }
         }
     }
 
