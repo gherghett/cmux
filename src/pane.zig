@@ -59,7 +59,10 @@ pub const Pane = struct {
         proc_history_count: u8 = 0,
 
         browser_tabs: [16]?BrowserTab = [_]?BrowserTab{null} ** 16,
-        browser_tab_box: ?*c.GtkBox = null, // container for browser tab buttons in overlay
+        browser_tab_box: ?*c.GtkBox = null,
+
+        /// Font size for this tab (zoom level). Persisted in session.
+        font_size: f64 = default_font_size,
 
         /// Per-tab CMUX_* env var storage (8 vars x 128 bytes)
         cmux_env_bufs: [8][128]u8 = undefined,
@@ -114,6 +117,50 @@ pub const Pane = struct {
             self.cached_leaf_pid = leaf;
             self.cached_leaf_time = now;
             return leaf;
+        }
+
+        /// Zoom in (increase font size)
+        pub fn zoomIn(self: *Tab) void {
+            self.font_size = @min(self.font_size + 1, 48);
+            self.applyFontWithFrozenLayout();
+        }
+
+        /// Zoom out (decrease font size)
+        pub fn zoomOut(self: *Tab) void {
+            self.font_size = @max(self.font_size - 1, 6);
+            self.applyFontWithFrozenLayout();
+        }
+
+        /// Reset zoom to default
+        pub fn zoomReset(self: *Tab) void {
+            self.font_size = default_font_size;
+            self.applyFontWithFrozenLayout();
+        }
+
+        /// Apply font size while freezing all ancestor GtkPaned positions
+        /// so the split layout doesn't rebalance.
+        fn applyFontWithFrozenLayout(self: *Tab) void {
+            // Walk up widget tree, save all GtkPaned positions
+            var saved: [8]struct { paned: *c.GtkPaned, pos: c_int } = undefined;
+            var count: usize = 0;
+            var cur: ?*c.GtkWidget = asWidget(self.terminal);
+            while (cur != null and count < 8) {
+                cur = c.gtk_widget_get_parent(cur.?);
+                if (cur) |w| {
+                    if (c.g_type_check_instance_is_a(@ptrCast(@alignCast(w)), c.gtk_paned_get_type()) != 0) {
+                        const paned: *c.GtkPaned = @ptrCast(@alignCast(w));
+                        saved[count] = .{ .paned = paned, .pos = c.gtk_paned_get_position(paned) };
+                        count += 1;
+                    }
+                }
+            }
+
+            configureTerminalAppearance(self.terminal, self.font_size);
+
+            // Restore all paned positions
+            for (saved[0..count]) |s| {
+                c.gtk_paned_set_position(s.paned, s.pos);
+            }
         }
 
         /// Get the CWD of the innermost foreground process via /proc.
@@ -235,11 +282,38 @@ pub const Pane = struct {
         c.gtk_widget_set_vexpand(asWidget(terminal), 1);
         c.gtk_widget_set_hexpand(asWidget(terminal), 1);
 
-        // Wrap terminal in GtkOverlay for floating browser-tab buttons
+        // Terminal settings
+        c.vte_terminal_set_scrollback_lines(terminal, 10000);
+        c.vte_terminal_set_scroll_unit_is_pixels(terminal, 0);
+        configureTerminalAppearance(terminal, default_font_size);
+
+        // Wrap terminal in GtkScrolledWindow for overlay scrollbar.
+        // VTE implements GtkScrollable, so the scrolled window connects
+        // automatically. The overlay policy shows the scrollbar only when
+        // scrolling, overlaid on top of the content — no permanent column.
+        const scrolled: *c.GtkScrolledWindow = @ptrCast(@alignCast(
+            c.gtk_scrolled_window_new() orelse return error.GtkWidgetCreateFailed,
+        ));
+        c.gtk_scrolled_window_set_policy(scrolled, c.GTK_POLICY_NEVER, c.GTK_POLICY_EXTERNAL);
+        c.gtk_scrolled_window_set_child(scrolled, asWidget(terminal));
+        c.gtk_widget_set_vexpand(asWidget(scrolled), 1);
+        c.gtk_widget_set_hexpand(asWidget(scrolled), 1);
+
+        // Add overlay scrollbar connected to VTE's own adjustment
+        const vadj = c.gtk_scrollable_get_vadjustment(@ptrCast(@alignCast(terminal)));
+        const scrollbar = c.gtk_scrollbar_new(c.GTK_ORIENTATION_VERTICAL, vadj);
+
+        // Wrap in GtkOverlay for floating scrollbar + browser-tab buttons
         const overlay: *c.GtkOverlay = @ptrCast(@alignCast(
             c.gtk_overlay_new() orelse return error.GtkWidgetCreateFailed,
         ));
-        c.gtk_overlay_set_child(overlay, asWidget(terminal));
+        c.gtk_overlay_set_child(overlay, asWidget(scrolled));
+        if (scrollbar) |sb| {
+            c.gtk_widget_set_halign(sb, c.GTK_ALIGN_END);
+            c.gtk_widget_set_valign(sb, c.GTK_ALIGN_FILL);
+            c.gtk_widget_set_opacity(sb, 0.5);
+            c.gtk_overlay_add_overlay(overlay, sb);
+        }
         c.gtk_widget_set_vexpand(asWidget(overlay), 1);
         c.gtk_widget_set_hexpand(asWidget(overlay), 1);
 
@@ -334,6 +408,54 @@ pub const Pane = struct {
     // Static shell path — lives for the entire program
     var shell_path_buf: [256:0]u8 = undefined;
     var shell_path_initialized: bool = false;
+    var scrollbar_css_loaded: bool = false;
+
+    // ── Terminal appearance ─────────────────────────────────
+    // GNOME dark style colors + Comic Mono font.
+    // Font size is per-tab (zoom with Ctrl+/Ctrl-), persisted in session.
+
+    pub const default_font_size: f64 = 13;
+
+    pub fn configureTerminalAppearance(terminal: *c.VteTerminal, font_size: f64) void {
+        // Font
+        var font_desc_buf: [64]u8 = undefined;
+        const font_str = std.fmt.bufPrint(&font_desc_buf, "Comic Mono {d}", .{font_size}) catch "Comic Mono 13";
+        var font_z: [65]u8 = undefined;
+        @memcpy(font_z[0..font_str.len], font_str);
+        font_z[font_str.len] = 0;
+        const desc = c.pango_font_description_from_string(&font_z);
+        if (desc) |d| {
+            c.vte_terminal_set_font(terminal, d);
+            c.pango_font_description_free(d);
+        }
+
+        // Colors: GNOME dark style
+        // bg: rgb(23,20,33)  fg: rgb(208,207,204)
+        const bg = c.GdkRGBA{ .red = 23.0 / 255.0, .green = 20.0 / 255.0, .blue = 33.0 / 255.0, .alpha = 1.0 };
+        const fg = c.GdkRGBA{ .red = 208.0 / 255.0, .green = 207.0 / 255.0, .blue = 204.0 / 255.0, .alpha = 1.0 };
+
+        // 16-color palette matching GNOME Terminal dark
+        const palette = [16]c.GdkRGBA{
+            .{ .red = 23.0 / 255.0, .green = 20.0 / 255.0, .blue = 33.0 / 255.0, .alpha = 1.0 }, // black
+            .{ .red = 192.0 / 255.0, .green = 28.0 / 255.0, .blue = 40.0 / 255.0, .alpha = 1.0 }, // red
+            .{ .red = 38.0 / 255.0, .green = 162.0 / 255.0, .blue = 105.0 / 255.0, .alpha = 1.0 }, // green
+            .{ .red = 162.0 / 255.0, .green = 115.0 / 255.0, .blue = 76.0 / 255.0, .alpha = 1.0 }, // yellow
+            .{ .red = 18.0 / 255.0, .green = 72.0 / 255.0, .blue = 139.0 / 255.0, .alpha = 1.0 }, // blue
+            .{ .red = 163.0 / 255.0, .green = 71.0 / 255.0, .blue = 186.0 / 255.0, .alpha = 1.0 }, // magenta
+            .{ .red = 42.0 / 255.0, .green = 161.0 / 255.0, .blue = 179.0 / 255.0, .alpha = 1.0 }, // cyan
+            .{ .red = 208.0 / 255.0, .green = 207.0 / 255.0, .blue = 204.0 / 255.0, .alpha = 1.0 }, // white
+            .{ .red = 94.0 / 255.0, .green = 92.0 / 255.0, .blue = 100.0 / 255.0, .alpha = 1.0 }, // bright black
+            .{ .red = 246.0 / 255.0, .green = 97.0 / 255.0, .blue = 81.0 / 255.0, .alpha = 1.0 }, // bright red
+            .{ .red = 51.0 / 255.0, .green = 209.0 / 255.0, .blue = 122.0 / 255.0, .alpha = 1.0 }, // bright green
+            .{ .red = 233.0 / 255.0, .green = 173.0 / 255.0, .blue = 12.0 / 255.0, .alpha = 1.0 }, // bright yellow
+            .{ .red = 42.0 / 255.0, .green = 123.0 / 255.0, .blue = 222.0 / 255.0, .alpha = 1.0 }, // bright blue
+            .{ .red = 192.0 / 255.0, .green = 97.0 / 255.0, .blue = 203.0 / 255.0, .alpha = 1.0 }, // bright magenta
+            .{ .red = 51.0 / 255.0, .green = 199.0 / 255.0, .blue = 222.0 / 255.0, .alpha = 1.0 }, // bright cyan
+            .{ .red = 255.0 / 255.0, .green = 255.0 / 255.0, .blue = 255.0 / 255.0, .alpha = 1.0 }, // bright white
+        };
+
+        c.vte_terminal_set_colors(terminal, &fg, &bg, &palette, 16);
+    }
 
     var home_buf: [256:0]u8 = undefined;
     var home_initialized: bool = false;

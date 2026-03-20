@@ -141,7 +141,12 @@ fn writeTreeNode(w: anytype, tree: *const SplitTree, idx: SplitTree.NodeIndex, s
                 if (tab.getCwd()) |cwd_ptr| {
                     writeJsonEscaped(w, std.mem.span(cwd_ptr));
                 }
-                w.writeAll("\" }") catch return;
+                w.writeAll("\"") catch return;
+                // Save font size if not default
+                if (tab.font_size != Pane.default_font_size) {
+                    std.fmt.format(w, ", \"font_size\": {d}", .{@as(u32, @intFromFloat(tab.font_size))}) catch return;
+                }
+                w.writeAll(" }") catch return;
             }
             w.writeAll("] }") catch return;
         },
@@ -532,7 +537,16 @@ fn restoreTreeNode(
                         break :blk cwd_z[0..cl :0];
                     } else null;
 
-                    _ = try pane.addTabDtach(cwd, dtach);
+                    const new_tab = try pane.addTabDtach(cwd, dtach);
+
+                    // Restore font size if saved
+                    if (extractJsonNumber(tab_json, "font_size")) |fs| {
+                        if (fs >= 6 and fs <= 48) {
+                            new_tab.font_size = fs;
+                            Pane.configureTerminalAppearance(new_tab.terminal, fs);
+                        }
+                    }
+
                     tpos = tab_end + 1;
                 }
             }
@@ -850,6 +864,26 @@ fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
     }
     if (pos >= json.len) return null;
     return json[start..pos];
+}
+
+/// Extract a JSON number value for a given key. Returns the parsed f64 or null.
+fn extractJsonNumber(json: []const u8, key: []const u8) ?f64 {
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return null;
+
+    const key_pos = std.mem.indexOf(u8, json, needle) orelse return null;
+    var pos = key_pos + needle.len;
+
+    // Skip : and whitespace
+    while (pos < json.len and (json[pos] == ' ' or json[pos] == ':' or json[pos] == '\t' or json[pos] == '\n')) : (pos += 1) {}
+    if (pos >= json.len) return null;
+
+    // Read digits (and optional decimal point)
+    const start = pos;
+    while (pos < json.len and (json[pos] >= '0' and json[pos] <= '9' or json[pos] == '.')) : (pos += 1) {}
+    if (pos == start) return null;
+
+    return std.fmt.parseFloat(f64, json[start..pos]) catch null;
 }
 
 fn extractJsonObject(json: []const u8, key: []const u8) ?[]const u8 {

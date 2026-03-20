@@ -253,6 +253,41 @@ pub const Window = struct {
             }
         }
 
+        // Ctrl only (no Shift) — zoom
+        const ctrl_only = c.GDK_CONTROL_MASK;
+        if (state & (ctrl_only | c.GDK_SHIFT_MASK) == ctrl_only) {
+            switch (keyval) {
+                c.GDK_KEY_plus, c.GDK_KEY_equal => {
+                    // Ctrl+= or Ctrl++ → zoom in
+                    if (tab_manager.current()) |ws| {
+                        if (ws.split_tree.focusedPane()) |pane| {
+                            if (pane.currentTab()) |tab| tab.zoomIn();
+                        }
+                    }
+                    return 1;
+                },
+                c.GDK_KEY_minus => {
+                    // Ctrl+- → zoom out
+                    if (tab_manager.current()) |ws| {
+                        if (ws.split_tree.focusedPane()) |pane| {
+                            if (pane.currentTab()) |tab| tab.zoomOut();
+                        }
+                    }
+                    return 1;
+                },
+                c.GDK_KEY_0 => {
+                    // Ctrl+0 → reset zoom
+                    if (tab_manager.current()) |ws| {
+                        if (ws.split_tree.focusedPane()) |pane| {
+                            if (pane.currentTab()) |tab| tab.zoomReset();
+                        }
+                    }
+                    return 1;
+                },
+                else => {},
+            }
+        }
+
         if (state & alt_mask == alt_mask) {
             if (keyval >= c.GDK_KEY_1 and keyval <= c.GDK_KEY_9) {
                 tab_manager.selectByIndex(keyval - c.GDK_KEY_1);
