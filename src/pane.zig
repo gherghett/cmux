@@ -312,7 +312,10 @@ pub const Pane = struct {
         self.dtach_path_len = dtach_sock_len;
 
         // Build command: dtach -A <socket> -Ez bash --rcfile <cmux-bash>
-        // --rcfile makes bash source our wrapper (which sources .bashrc + cmux shell init)
+        // --rcfile tells bash to source our wrapper instead of ~/.bashrc.
+        // cmux-bash sources ~/.bashrc + cmux-shell-init.sh, so the user gets
+        // their normal shell environment plus cmux integration (process tracking,
+        // claude wrapper).
         // -E disables detach char, -z disables suspend
         const sock_path_z: [*:0]const u8 = dtach_sock[0..dtach_sock_len :0];
         const shell_z: [*:0]const u8 = &shell_path_buf;

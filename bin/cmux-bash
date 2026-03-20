@@ -1,11 +1,17 @@
 #!/bin/bash
 # Wrapper that sources the user's bashrc + cmux shell integration.
-# Used by cmux as the shell command for dtach panes.
+# Used by cmux as the shell command for dtach panes (via --rcfile).
 
 # Source user's bashrc (if interactive, which we are)
 [ -f ~/.bashrc ] && source ~/.bashrc
 
-# Source cmux shell integration (process history, claude hooks)
+# Source cmux shell integration (process history tracking)
 if [ -n "$CMUX_SHELL_INTEGRATION_DIR" ] && [ -f "$CMUX_SHELL_INTEGRATION_DIR/cmux-shell-init.sh" ]; then
     source "$CMUX_SHELL_INTEGRATION_DIR/cmux-shell-init.sh"
+fi
+
+# Re-prepend cmux bin/ to PATH AFTER .bashrc (which may have overridden it).
+# This ensures bin/claude wrapper is found before the real binary.
+if [ -n "$CMUX_SHELL_INTEGRATION_DIR" ]; then
+    export PATH="$CMUX_SHELL_INTEGRATION_DIR:$PATH"
 fi
